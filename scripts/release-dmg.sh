@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 TRIPLE="arm64-apple-macosx14.4"
-APP="$ROOT/.build/LevelUpPrototype.app"
+APP="$ROOT/.build/LevelUp.app"
 EXECUTABLE="$APP/Contents/MacOS/SystemAudioPassThrough"
 OUTPUT_DIR="$ROOT/release"
 DMG="$OUTPUT_DIR/LevelUp.dmg"

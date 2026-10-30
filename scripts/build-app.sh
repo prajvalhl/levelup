@@ -7,7 +7,7 @@ cd "$ROOT"
 TRIPLE="arm64-apple-macosx14.4"
 swift build -c release --triple "$TRIPLE"
 BIN_DIR="$(swift build -c release --triple "$TRIPLE" --show-bin-path)"
-APP="$ROOT/.build/LevelUpPrototype.app"
+APP="$ROOT/.build/LevelUp.app"
 ICON="$ROOT/.build/generated-icon/LevelUp.icns"
 "$ROOT/scripts/build-icon.sh"
 

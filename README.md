@@ -81,10 +81,10 @@ swift test --triple arm64-apple-macosx14.4
 scripts/build-app.sh
 ```
 
-The app bundle is written to `.build/LevelUpPrototype.app`. To open it locally:
+The app bundle is written to `.build/LevelUp.app`. To open it locally:
 
 ```sh
-open -a "$PWD/.build/LevelUpPrototype.app"
+open -a "$PWD/.build/LevelUp.app"
 ```
 
 Build the free distributable image (runs tests and bundle/signature checks as part of the workflow):
@@ -100,7 +100,7 @@ The output is `release/LevelUp.dmg`; `.build/` and `release/` are ignored by Git
 The bundled executable also supports the existing controlled diagnostic route. This is intended for development/debugging rather than everyday use. It requires an explicit acknowledgement because the tap can mute original app audio while active:
 
 ```sh
-open -a "$PWD/.build/LevelUpPrototype.app" --args \
+open -a "$PWD/.build/LevelUp.app" --args \
   --i-understand-system-audio-will-be-muted \
   --launch-method=launchservices \
   --log-path=/private/tmp/levelup-dsp-bypass.log \
