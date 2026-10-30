@@ -119,7 +119,7 @@ open -a "$PWD/.build/LevelUp.app" --args \
 
 ## Known limitations
 
-- **Intermittent startup:** in a prior controlled lifecycle test, 9 of 10 starts activated. One returned success from `AudioDeviceStart`, but the aggregate remained not running and no callbacks arrived; cleanup succeeded. This remains unresolved. The watchdog stops a route with no callbacks after five seconds; having no callbacks does not by itself prove a permission failure or a Core Audio defect.
+- **Intermittent startup remains unresolved:** an initial controlled lifecycle test activated 9 of 10 times. The failed attempt returned success from `AudioDeviceStart`, but the aggregate stayed not running and no callbacks arrived; cleanup succeeded. In a follow-up 10-cycle test on October 30, 2026, all 10 attempts activated and completed cleanup successfully. In one of those successful attempts, the aggregate initially reported not running immediately after `AudioDeviceStart`, then reported running and delivered callbacks by the first watchdog poll. This later sample did not reproduce the failure and does not establish that it is fixed. The watchdog stops a route with no callbacks after five seconds; no callbacks alone do not prove a permission failure or a Core Audio defect. Callback peaks show non-silent samples were processed, but do not identify the exact source waveform.
 - **Requires active audio at startup:** the aggregate may wait for the process tap to receive audio. Start playback in another app before starting LevelUp.
 - **Sample-peak limiting only:** the limiter has no lookahead and does not guarantee true-peak limiting. LevelUp is not a complete loudness equalizer or broadcast loudness processor.
 - **No automatic recovery:** output-device reconnection and sleep/wake recovery are not implemented. Stop and start the route again after changing devices or resuming from sleep.
@@ -128,7 +128,7 @@ open -a "$PWD/.build/LevelUp.app" --args \
 
 ## Transparency and license
 
-**LevelUp is a vibe-coded app.** It was developed iteratively with AI coding assistance from human direction and review. The project includes automated tests and manual listening/lifecycle validation, but AI-assisted development does not guarantee correctness; the known startup reliability issue above is one example of a remaining limitation. Contributions and independent review are welcome.
+**LevelUp is a vibe-coded app.** It was developed iteratively with AI coding assistance from human direction and review. The project includes automated tests and manual listening/lifecycle validation, but AI-assisted development does not guarantee correctness; the unresolved, intermittently observed startup behavior above is one example of a remaining limitation. Contributions and independent review are welcome.
 
 LevelUp is licensed under the [MIT License](LICENSE).
 
