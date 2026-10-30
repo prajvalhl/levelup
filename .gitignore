@@ -1,0 +1,25 @@
+.build/
+.swiftpm/
+.DS_Store
+*.log
+*.xcuserstate
+xcuserdata/
+DerivedData/
+release/
+
+# Local configuration and signing material
+.env
+.env.*
+*.p12
+*.pfx
+*.cer
+*.crt
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.pem
+*.key
+*.jks
+*.keystore
+id_rsa
+id_ed25519

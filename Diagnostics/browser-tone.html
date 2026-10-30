@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LevelUp browser audio validation</title>
+<style>
+  body { font: 16px system-ui; max-width: 38rem; margin: 3rem auto; }
+  button { font: inherit; margin-right: .5rem; padding: .6rem 1rem; }
+  #status { margin-top: 1rem; }
+</style>
+<h1>Browser audio validation</h1>
+<p>Start a continuous 440 Hz tone at approximately −20 dBFS. Stop it before disabling the prototype route.</p>
+<button id="start">Start tone</button>
+<button id="stop" disabled>Stop tone</button>
+<p id="status" role="status">Stopped</p>
+<script>
+  let context;
+  let oscillator;
+  let gain;
+  const status = document.querySelector("#status");
+  document.querySelector("#start").addEventListener("click", async () => {
+    context ??= new AudioContext();
+    await context.resume();
+    oscillator = context.createOscillator();
+    gain = context.createGain();
+    oscillator.frequency.value = 440;
+    gain.gain.value = 0.1;
+    oscillator.connect(gain).connect(context.destination);
+    oscillator.start();
+    document.querySelector("#start").disabled = true;
+    document.querySelector("#stop").disabled = false;
+    status.textContent = `Playing 440 Hz; AudioContext ${context.state}`;
+  });
+  document.querySelector("#stop").addEventListener("click", () => {
+    if (oscillator) oscillator.stop();
+    oscillator = undefined;
+    document.querySelector("#start").disabled = false;
+    document.querySelector("#stop").disabled = true;
+    status.textContent = "Stopped";
+  });
+</script>
