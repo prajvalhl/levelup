@@ -262,6 +262,7 @@ final class LevelUpModel: ObservableObject {
         }
         let listenerSession = listenerSessionEpoch
         let listeners = outputListeners
+        let controlQueue = audioQueue
 
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(30)) { [weak self] in
             guard control.requestStartupTimeout() == true else { return }
@@ -271,21 +272,21 @@ final class LevelUpModel: ObservableObject {
             }
         }
 
-        audioQueue.async { [weak self] in
+        controlQueue.async { [weak self] in
             var failure: String?
             do {
                 listeners.installSystemListeners(sessionEpoch: listenerSession)
                 if let expectedOutput {
-                    let token = listeners.installActiveDeviceListener(AudioDeviceID(expectedOutput.identity.deviceID),
-                                                                      sessionEpoch: listenerSession,
-                                                                      routeGeneration: operation)
+                    let token = try listeners.installActiveDeviceListener(AudioDeviceID(expectedOutput.identity.deviceID),
+                                                                          sessionEpoch: listenerSession,
+                                                                          routeGeneration: operation)
                     DispatchQueue.main.async { [weak self] in self?.activeDeviceListenerToken = token }
                 }
                 try route.start()
                 if expectedOutput == nil {
-                    let token = listeners.installActiveDeviceListener(route.outputDeviceID,
-                                                                      sessionEpoch: listenerSession,
-                                                                      routeGeneration: operation)
+                    let token = try listeners.installActiveDeviceListener(route.outputDeviceID,
+                                                                          sessionEpoch: listenerSession,
+                                                                          routeGeneration: operation)
                     DispatchQueue.main.async { [weak self] in self?.activeDeviceListenerToken = token }
                 }
             } catch {
@@ -293,13 +294,20 @@ final class LevelUpModel: ObservableObject {
             }
             let pendingStop = control.completeStartup()
             if failure != nil || pendingStop != nil {
-                let cleanupSucceeded = route.stop()
-                DispatchQueue.main.async {
+                StartupAttemptCleanup.enqueue(on: controlQueue,
+                                               stopRoute: {
+                                                   let succeeded = route.stop()
+                                                   return (succeeded, route.lastCleanupFailure)
+                                               },
+                                               removeActiveListener: {
+                                                   listeners.removeActiveDeviceListener()
+                                               }) { [weak self] cleanup in
                     self?.finishStart(operation: operation,
                                       failure: failure,
                                       pendingStop: pendingStop,
-                                      cleanupSucceeded: cleanupSucceeded,
-                                      cleanupFailure: route.lastCleanupFailure)
+                                      cleanupSucceeded: cleanup.isComplete,
+                                      routeStopped: cleanup.routeStopped,
+                                      cleanupFailure: cleanup.failure)
                 }
             } else {
                 DispatchQueue.main.async {
@@ -421,11 +429,17 @@ final class LevelUpModel: ObservableObject {
                                            sessionEpoch: UInt64,
                                            routeGeneration: Int?,
                                            listenerToken: UUID) {
-        guard listenerSessionActive, sessionEpoch == listenerSessionEpoch else { return }
-        if case .activeDeviceAliveChanged = event {
-            guard listenerToken == activeDeviceListenerToken,
-                  routeGeneration == generation else { return }
-        }
+        let isActiveDeviceEvent: Bool
+        if case .activeDeviceAliveChanged = event { isActiveDeviceEvent = true }
+        else { isActiveDeviceEvent = false }
+        guard ListenerEventGate.accepts(sessionActive: listenerSessionActive,
+                                        eventSessionEpoch: sessionEpoch,
+                                        currentSessionEpoch: listenerSessionEpoch,
+                                        isActiveDeviceEvent: isActiveDeviceEvent,
+                                        eventToken: listenerToken,
+                                        activeDeviceToken: activeDeviceListenerToken,
+                                        eventRouteGeneration: routeGeneration,
+                                        currentRouteGeneration: generation) else { return }
         _ = lifecycle.advanceOutputEventRevision()
         if recoveryIsActive {
             outputStabilityGate.invalidate(revision: lifecycle.outputEventRevision)
@@ -581,16 +595,17 @@ final class LevelUpModel: ObservableObject {
                              failure: String?,
                              pendingStop: String?,
                              cleanupSucceeded: Bool,
+                             routeStopped: Bool,
                              cleanupFailure: String?) {
         guard generation == operation else { return }
         startupTimedOut = false
         let wasRecoveryAttempt = isRecoveryStart
         isRecoveryStart = false
         _ = lifecycle.startupFailed(generation: operation, cleanupSucceeded: cleanupSucceeded)
-        if cleanupSucceeded {
-            let listeners = outputListeners
-            listeners.removeActiveDeviceListener()
+        if routeStopped {
             activeDeviceListenerToken = nil
+        }
+        if cleanupSucceeded {
             engine = nil
             startupControl = nil
             activeMode = nil
@@ -734,7 +749,12 @@ final class LevelUpModel: ObservableObject {
         listenerSessionEpoch &+= 1
         activeDeviceListenerToken = nil
         let listeners = outputListeners
-        audioQueue.async { listeners.removeSessionListeners(sessionEpoch: registeredEpoch) }
+        audioQueue.async {
+            let failures = listeners.removeSessionListeners(sessionEpoch: registeredEpoch)
+            for failure in failures {
+                DiagnosticLog.write("Listener cleanup incomplete: \(failure); sessionEpoch=\(registeredEpoch)")
+            }
+        }
     }
 
     func applyChanges() {
@@ -754,13 +774,14 @@ final class LevelUpModel: ObservableObject {
         let listeners = outputListeners
         let sessionEpoch = listenerSessionEpoch
         audioQueue.async { [weak self] in
-            let success = route.stop()
-            if success && (reason == .outputRecovery || reason == .userStop || reason == .quit) {
-                listeners.removeActiveDeviceListener()
-            }
+            let routeStopped = route.stop()
+            let listenerFailure = routeStopped ? listeners.removeActiveDeviceListener() : nil
+            let success = routeStopped && listenerFailure == nil
+            let cleanupFailure = routeStopped ? listenerFailure : route.lastCleanupFailure
             DispatchQueue.main.async {
                 guard let self, self.generation == operation else { return }
                 self.cleanupInFlight = false
+                if routeStopped { self.activeDeviceListenerToken = nil }
                 if success {
                     self.engine = nil
                     self.startupControl = nil
@@ -789,7 +810,7 @@ final class LevelUpModel: ObservableObject {
                     }
                 } else {
                     self.lifecycle.cleanupFailed(reason: reason)
-                    self.state = .error(self.cleanupIncompleteMessage(route.lastCleanupFailure))
+                    self.state = .error(self.cleanupIncompleteMessage(cleanupFailure))
                 }
             }
         }

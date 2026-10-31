@@ -1,10 +1,15 @@
 import CoreAudio
 import Foundation
+import PrototypeSupport
 
 enum CoreAudioOutputEvent: Equatable {
     case defaultOutputChanged
     case deviceListChanged
     case activeDeviceAliveChanged(AudioDeviceID)
+}
+
+private struct ListenerRemovalError: Error, CustomStringConvertible {
+    let description: String
 }
 
 /// Owns only Core Audio listener registrations. It makes no lifecycle or
@@ -24,7 +29,7 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
     private let operationQueue: DispatchQueue
     private let deliveryQueue: DispatchQueue
     private let sink: (UInt64, Int?, UUID, CoreAudioOutputEvent) -> Void
-    private var registrations: [Registration] = []
+    private var registrations = ListenerRegistrationStore<UUID, Registration>()
     private(set) var currentActiveToken: UUID?
 
     init(operationQueue: DispatchQueue,
@@ -37,7 +42,7 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
 
     var activeDeviceID: AudioDeviceID? {
         guard let currentActiveToken else { return nil }
-        return registrations.first(where: { $0.token == currentActiveToken }).map { AudioDeviceID($0.objectID) }
+        return registrations.values.first(where: { $0.token == currentActiveToken }).map { AudioDeviceID($0.objectID) }
     }
 
     func installSystemListeners(sessionEpoch: UInt64) {
@@ -58,9 +63,11 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
 
     func installActiveDeviceListener(_ deviceID: AudioDeviceID,
                                      sessionEpoch: UInt64,
-                                     routeGeneration: Int) -> UUID? {
+                                     routeGeneration: Int) throws -> UUID? {
         dispatchPrecondition(condition: .onQueue(operationQueue))
-        removeActiveDeviceListener()
+        if let failure = removeActiveDeviceListener() {
+            throw ListenerRemovalError(description: failure)
+        }
         currentActiveToken = install(kind: .activeAlive,
                                      objectID: AudioObjectID(deviceID),
                                      selector: kAudioDevicePropertyDeviceIsAlive,
@@ -70,15 +77,18 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
         return currentActiveToken
     }
 
-    func removeActiveDeviceListener() {
+    @discardableResult
+    func removeActiveDeviceListener() -> String? {
         dispatchPrecondition(condition: .onQueue(operationQueue))
-        remove(where: { $0.kind == .activeAlive })
+        let failures = remove(where: { $0.kind == .activeAlive })
         currentActiveToken = nil
+        return failures.first
     }
 
-    func removeSessionListeners(sessionEpoch: UInt64) {
+    @discardableResult
+    func removeSessionListeners(sessionEpoch: UInt64) -> [String] {
         dispatchPrecondition(condition: .onQueue(operationQueue))
-        remove(where: { $0.sessionEpoch == sessionEpoch })
+        return remove(where: { $0.sessionEpoch == sessionEpoch })
     }
 
     private func install(kind: Kind,
@@ -90,7 +100,12 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
         if registrations.contains(where: {
             $0.kind == kind && $0.objectID == objectID && $0.sessionEpoch == sessionEpoch &&
             $0.routeGeneration == routeGeneration
-        }) { return registrations.last(where: { $0.kind == kind && $0.sessionEpoch == sessionEpoch })?.token }
+        }) {
+            return registrations.values.first(where: {
+                $0.kind == kind && $0.objectID == objectID && $0.sessionEpoch == sessionEpoch &&
+                $0.routeGeneration == routeGeneration
+            })?.token
+        }
 
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
@@ -106,18 +121,20 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
         let status = AudioObjectAddPropertyListenerBlock(objectID, &address, deliveryQueue, listener)
         DiagnosticLog.write("CoreAudio AudioObjectAddPropertyListenerBlock kind=\(kind) objectID=\(objectID) selector=\(selector): \(statusDescription(status))")
         guard status == noErr else { return nil }
-        registrations.append(Registration(kind: kind,
-                                          objectID: objectID,
-                                          address: address,
-                                          sessionEpoch: sessionEpoch,
-                                          routeGeneration: routeGeneration,
-                                          token: token,
-                                          listener: listener))
+        registrations.insert(Registration(kind: kind,
+                                           objectID: objectID,
+                                           address: address,
+                                           sessionEpoch: sessionEpoch,
+                                           routeGeneration: routeGeneration,
+                                           token: token,
+                                           listener: listener),
+                             forKey: token)
         return token
     }
 
-    private func remove(where predicate: (Registration) -> Bool) {
-        let candidates = registrations.filter(predicate)
+    private func remove(where predicate: (Registration) -> Bool) -> [String] {
+        let candidates = registrations.values.filter(predicate)
+        var failures: [String] = []
         for registration in candidates {
             var address = registration.address
             let status = AudioObjectRemovePropertyListenerBlock(registration.objectID,
@@ -125,11 +142,13 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
                                                                 deliveryQueue,
                                                                 registration.listener)
             DiagnosticLog.write("CoreAudio AudioObjectRemovePropertyListenerBlock kind=\(registration.kind) objectID=\(registration.objectID) selector=\(address.mSelector): \(statusDescription(status)); token=\(registration.token)")
-            if status == noErr {
-                registrations.removeAll(where: { $0.token == registration.token })
+            registrations.removeValue(forKey: registration.token, removalSucceeded: status == noErr)
+            if status != noErr {
+                failures.append("AudioObjectRemovePropertyListenerBlock for \(registration.kind) returned \(statusDescription(status))")
             }
             // On failure keep the exact block, queue, object and address so a
             // later removal can be retried and late events remain identifiable.
         }
+        return failures
     }
 }
