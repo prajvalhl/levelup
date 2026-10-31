@@ -1366,7 +1366,10 @@ struct LevelUpPopover: View {
     private func infoCard(title: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title).font(.system(size: 12, weight: .semibold))
-            Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(detail)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
