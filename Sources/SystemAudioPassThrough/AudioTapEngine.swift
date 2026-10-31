@@ -41,6 +41,7 @@ final class AudioTapEngine: @unchecked Sendable {
     private var defaultOutputID = AudioDeviceID(kAudioObjectUnknown)
     private let dspMode: DSPMode
     private let startupCancellationReason: () -> String?
+    private let expectedOutputIdentity: OutputDeviceIdentity?
 
     private(set) var deviceName = ""
     private(set) var deviceUID = ""
@@ -49,11 +50,15 @@ final class AudioTapEngine: @unchecked Sendable {
     private(set) var bufferFrames: UInt32 = 0
     private(set) var tapDescription = ""
     private(set) var tapUID = ""
+    private(set) var outputIdentity: OutputDeviceIdentity?
     private(set) var started = false
     private(set) var lastCleanupFailure: String?
 
-    init(dspMode: DSPMode = .bypass, startupCancellationReason: @escaping () -> String? = { nil }) {
+    init(dspMode: DSPMode = .bypass,
+         expectedOutputIdentity: OutputDeviceIdentity? = nil,
+         startupCancellationReason: @escaping () -> String? = { nil }) {
         self.dspMode = dspMode
+        self.expectedOutputIdentity = expectedOutputIdentity
         self.startupCancellationReason = startupCancellationReason
     }
 
@@ -66,12 +71,17 @@ final class AudioTapEngine: @unchecked Sendable {
         do {
             // Resolve the destination before creating a muted tap. If there is
             // no usable default output, fail without muting any source process.
-            let output = try defaultOutputDevice()
+            let resolvedOutput = try resolveDefaultOutputSnapshot()
+            let output = AudioDeviceID(resolvedOutput.snapshot.identity.deviceID)
+            if let expectedOutputIdentity, expectedOutputIdentity != resolvedOutput.snapshot.identity {
+                throw AudioDeviceError.startupCancelled("the default output changed after it was validated")
+            }
+            outputIdentity = resolvedOutput.snapshot.identity
             defaultOutputID = output
-            deviceName = try stringProperty(kAudioObjectPropertyName, on: output, name: "output device name")
-            deviceUID = try stringProperty(kAudioDevicePropertyDeviceUID, on: output, name: "output device UID")
-            rate = try sampleRate(of: output)
-            let physicalFormat = try outputFormat(of: output)
+            deviceName = resolvedOutput.snapshot.name
+            deviceUID = resolvedOutput.snapshot.identity.uid
+            rate = resolvedOutput.snapshot.nominalSampleRate
+            let physicalFormat = resolvedOutput.format
             guard physicalFormat.mChannelsPerFrame > 0,
                   (physicalFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
                   physicalFormat.mBitsPerChannel == 32 else {
@@ -171,9 +181,9 @@ final class AudioTapEngine: @unchecked Sendable {
                 ]]
             ]
             DiagnosticLog.write("aggregate creation requested: name=LevelUp Pass Through Proof of Concept, UID=\(aggregateUID), outputDeviceUID=\(deviceUID), tapUID=\(tapUID), tapAutoStart=true (installed SDK: start waits for the first tap receiving audio)")
-            DiagnosticLog.write(String(format: "CoreAudio AudioHardwareCreateAggregateDevice begin; elapsedMs=%.3f", startupElapsedMilliseconds))
+            DiagnosticLog.write("CoreAudio AudioHardwareCreateAggregateDevice begin; monotonicNs=\(DispatchTime.now().uptimeNanoseconds); elapsedMs=\(startupElapsedMilliseconds); requestedUID=\(aggregateUID)")
             let aggregateStatus = AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &aggregateID)
-            DiagnosticLog.write(String(format: "CoreAudio AudioHardwareCreateAggregateDevice returned %@; elapsedMs=%.3f; aggregateDeviceID=%u", statusDescription(aggregateStatus), startupElapsedMilliseconds, aggregateID))
+            DiagnosticLog.write("CoreAudio AudioHardwareCreateAggregateDevice returned \(statusDescription(aggregateStatus)); monotonicNs=\(DispatchTime.now().uptimeNanoseconds); elapsedMs=\(startupElapsedMilliseconds); aggregateDeviceID=\(aggregateID); requestedUID=\(aggregateUID)")
             if aggregateID != AudioObjectID(kAudioObjectUnknown) { cleanupLifecycle.aggregateCreated() }
             try check(aggregateStatus, "create private aggregate device")
             try checkStartupCancellation("after aggregate-device creation")
@@ -268,9 +278,14 @@ final class AudioTapEngine: @unchecked Sendable {
             guard let ioProcID else { throw AudioDeviceError.osStatus("create aggregate IO callback", -1) }
             DiagnosticLog.write("CoreAudio IOProc confirmed created: aggregateID=\(aggregateID), IOProcID=\(String(describing: ioProcID))")
             markStartupStage("IOProc registered on aggregate device")
+            if let expectedOutputIdentity {
+                let latest = try resolveDefaultOutputSnapshot()
+                guard latest.snapshot.identity == expectedOutputIdentity else {
+                    throw AudioDeviceError.startupCancelled("the default output changed before AudioDeviceStart")
+                }
+            }
             audioDeviceStartAttemptNanoseconds = DispatchTime.now().uptimeNanoseconds
             logAggregateRunningState(stage: "immediately before AudioDeviceStart")
-            logBrowserHelperOutputState(stage: "immediately before AudioDeviceStart")
             DiagnosticLog.write(String(format: "CoreAudio AudioDeviceStart begin; elapsedMs=%.3f; aggregateID=%u; IOProcID=%@; captureAuthorization=indeterminate", startupElapsedMilliseconds, aggregateID, String(describing: ioProcID)))
             cleanupLifecycle.ioProcStartAttempted()
             let startStatus = AudioDeviceStart(aggregateID, ioProcID)
@@ -297,7 +312,7 @@ final class AudioTapEngine: @unchecked Sendable {
 
     private func checkStartupCancellation(_ stage: String) throws {
         guard let reason = startupCancellationReason() else { return }
-        DiagnosticLog.write("startup cancellation observed at \(stage); reason=\(reason); beginning ordered cleanup")
+        DiagnosticLog.write("startup cancellation observed; monotonicNs=\(DispatchTime.now().uptimeNanoseconds); stage=\(stage); reason=\(reason); expectedOutput=\(String(describing: expectedOutputIdentity)); resolvedOutput=\(String(describing: outputIdentity)); beginning ordered cleanup")
         throw AudioDeviceError.startupCancelled(reason)
     }
 
@@ -332,6 +347,21 @@ final class AudioTapEngine: @unchecked Sendable {
         DiagnosticLog.write(String(format: "CoreAudio aggregate running-state query stage=%@ aggregateID=%u: %@; dataSize=%u; running=%@; elapsedSinceAudioDeviceStartAttemptMs=%.3f; callbacks=%llu", stage, aggregateID, statusDescription(status), dataSize, runningValue, elapsedMilliseconds, callbackCount))
     }
 
+    func aggregateIsRunning() -> Bool? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunning,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(aggregateID, &address, 0, nil, &size, &running)
+        guard status == noErr, size == UInt32(MemoryLayout<UInt32>.size), running <= 1 else {
+            DiagnosticLog.write("CoreAudio aggregate health query kAudioDevicePropertyDeviceIsRunning aggregateID=\(aggregateID): \(statusDescription(status)); dataSize=\(size); value=\(running); callbacks=\(callbackCount)")
+            return nil
+        }
+        DiagnosticLog.write("CoreAudio aggregate health query kAudioDevicePropertyDeviceIsRunning aggregateID=\(aggregateID): \(statusDescription(status)); dataSize=\(size); value=\(running); callbacks=\(callbackCount)")
+        return running == 1
+    }
+
     /// Reads the tap's actual description through Apple's throwing AudioHardwareTap
     /// getter where that API is available. This diagnostic never mutates the tap.
     private func logTapDescription() {
@@ -357,176 +387,6 @@ final class AudioTapEngine: @unchecked Sendable {
             let error = error as NSError
             DiagnosticLog.write("CoreAudio kAudioTapPropertyDescription readback failed; tapID=\(tapID); errorDomain=\(error.domain); errorCode=\(error.code); description=\(error.localizedDescription)")
         }
-    }
-
-    /// Samples the verified Brave helper's output state and output-device list.
-    /// All failures are diagnostic-only and do not affect route startup or policy.
-    func logBrowserHelperOutputState(stage: String) {
-        let helperBundleID = "com.brave.Browser.helper"
-        let systemObject = AudioObjectID(kAudioObjectSystemObject)
-        var listAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyProcessObjectList,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        guard AudioObjectHasProperty(systemObject, &listAddress) else {
-            DiagnosticLog.write("CoreAudio Brave helper diagnostics stage=\(stage): process-object list UNSUPPORTED; callbacks=\(callbackCount)")
-            return
-        }
-
-        var listBytes: UInt32 = 0
-        let sizeStatus = AudioObjectGetPropertyDataSize(systemObject, &listAddress, 0, nil, &listBytes)
-        guard sizeStatus == noErr else {
-            DiagnosticLog.write("CoreAudio Brave helper diagnostics stage=\(stage): process-object list size query failed; \(statusDescription(sizeStatus)); dataSize=\(listBytes); callbacks=\(callbackCount)")
-            return
-        }
-        guard listBytes % UInt32(MemoryLayout<AudioObjectID>.size) == 0 else {
-            DiagnosticLog.write("CoreAudio Brave helper diagnostics stage=\(stage): process-object list INVALID_SIZE; dataSize=\(listBytes); callbacks=\(callbackCount)")
-            return
-        }
-        var processIDs = [AudioObjectID](repeating: AudioObjectID(kAudioObjectUnknown), count: Int(listBytes) / MemoryLayout<AudioObjectID>.size)
-        if listBytes > 0 {
-            var returnedBytes = listBytes
-            let listStatus = processIDs.withUnsafeMutableBufferPointer { buffer in
-                AudioObjectGetPropertyData(systemObject, &listAddress, 0, nil, &returnedBytes, buffer.baseAddress!)
-            }
-            guard listStatus == noErr,
-                  returnedBytes % UInt32(MemoryLayout<AudioObjectID>.size) == 0,
-                  returnedBytes <= listBytes else {
-                DiagnosticLog.write("CoreAudio Brave helper diagnostics stage=\(stage): process-object list data query failed/invalid; \(statusDescription(listStatus)); dataSize=\(returnedBytes); callbacks=\(callbackCount)")
-                return
-            }
-            processIDs = Array(processIDs.prefix(Int(returnedBytes) / MemoryLayout<AudioObjectID>.size))
-        }
-
-        var bundleAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioProcessPropertyBundleID,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var matches: [(objectID: AudioObjectID, pid: pid_t)] = []
-        for processID in processIDs {
-            guard AudioObjectHasProperty(processID, &bundleAddress) else {
-                DiagnosticLog.write("CoreAudio process kAudioProcessPropertyBundleID: UNSUPPORTED; objectID=\(processID); helperMatch=unavailable")
-                continue
-            }
-            var bundleID: Unmanaged<CFString>?
-            var bundleBytes = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-            let bundleStatus = AudioObjectGetPropertyData(processID, &bundleAddress, 0, nil, &bundleBytes, &bundleID)
-            guard bundleStatus == noErr else {
-                DiagnosticLog.write("CoreAudio process kAudioProcessPropertyBundleID query failed; objectID=\(processID); \(statusDescription(bundleStatus)); dataSize=\(bundleBytes); helperMatch=unavailable")
-                continue
-            }
-            guard bundleBytes == UInt32(MemoryLayout<Unmanaged<CFString>?>.size) else {
-                if let bundleID { _ = bundleID.takeRetainedValue() }
-                DiagnosticLog.write("CoreAudio process kAudioProcessPropertyBundleID INVALID_SIZE; objectID=\(processID); OSStatus 0; dataSize=\(bundleBytes); helperMatch=unavailable")
-                continue
-            }
-            guard let bundleID else {
-                DiagnosticLog.write("CoreAudio process kAudioProcessPropertyBundleID returned no value; objectID=\(processID); OSStatus 0; dataSize=\(bundleBytes); helperMatch=unavailable")
-                continue
-            }
-            guard bundleID.takeRetainedValue() as String == helperBundleID else { continue }
-
-            var pidAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioProcessPropertyPID,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            var pid: pid_t = 0
-            var pidBytes = UInt32(MemoryLayout<pid_t>.size)
-            let pidStatus = AudioObjectGetPropertyData(processID, &pidAddress, 0, nil, &pidBytes, &pid)
-            if pidStatus != noErr || pidBytes != UInt32(MemoryLayout<pid_t>.size) {
-                DiagnosticLog.write("CoreAudio process kAudioProcessPropertyPID query failed/invalid for Brave helper objectID=\(processID); \(statusDescription(pidStatus)); dataSize=\(pidBytes)")
-            }
-            matches.append((processID, pidStatus == noErr && pidBytes == UInt32(MemoryLayout<pid_t>.size) ? pid : -1))
-        }
-
-        guard !matches.isEmpty else {
-            DiagnosticLog.write("CoreAudio Brave helper diagnostics stage=\(stage): NO_MATCH; bundleID=\(helperBundleID); processObjectsEnumerated=\(processIDs.count); callbacks=\(callbackCount)")
-            return
-        }
-
-        let elapsedMilliseconds: Double
-        if audioDeviceStartAttemptNanoseconds != 0 {
-            elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds &- audioDeviceStartAttemptNanoseconds) / 1_000_000
-        } else {
-            elapsedMilliseconds = -1
-        }
-        for match in matches {
-            logBraveHelperProcess(match.objectID,
-                                  pid: match.pid,
-                                  bundleID: helperBundleID,
-                                  stage: stage,
-                                  elapsedMilliseconds: elapsedMilliseconds)
-        }
-    }
-
-    private func logBraveHelperProcess(_ processID: AudioObjectID,
-                                       pid: pid_t,
-                                       bundleID: String,
-                                       stage: String,
-                                       elapsedMilliseconds: Double) {
-        var runningAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioProcessPropertyIsRunningOutput,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var runningValue: UInt32 = 0
-        var runningBytes = UInt32(MemoryLayout<UInt32>.size)
-        let runningStatus: OSStatus
-        let runningResult: String
-        if !AudioObjectHasProperty(processID, &runningAddress) {
-            runningStatus = kAudioHardwareUnknownPropertyError
-            runningResult = "UNSUPPORTED"
-        } else {
-            runningStatus = AudioObjectGetPropertyData(processID, &runningAddress, 0, nil, &runningBytes, &runningValue)
-            if runningStatus != noErr {
-                runningResult = "QUERY_FAILED"
-            } else if runningBytes != UInt32(MemoryLayout<UInt32>.size) {
-                runningResult = "INVALID_SIZE"
-            } else if runningValue == 0 {
-                runningResult = "NOT_RUNNING_OUTPUT"
-            } else if runningValue == 1 {
-                runningResult = "RUNNING_OUTPUT"
-            } else {
-                runningResult = "INVALID_VALUE(\(runningValue))"
-            }
-        }
-        DiagnosticLog.write("CoreAudio process kAudioProcessPropertyIsRunningOutput stage=\(stage): objectID=\(processID) pid=\(pid) bundleID=\(bundleID); \(statusDescription(runningStatus)); dataSize=\(runningBytes); value=\(runningResult); elapsedSinceAudioDeviceStartAttemptMs=\(String(format: "%.3f", elapsedMilliseconds)); callbacks=\(callbackCount)")
-
-        var devicesAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioProcessPropertyDevices,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        guard AudioObjectHasProperty(processID, &devicesAddress) else {
-            DiagnosticLog.write("CoreAudio process kAudioProcessPropertyDevices stage=\(stage): objectID=\(processID) pid=\(pid) bundleID=\(bundleID) scope=output; UNSUPPORTED; callbacks=\(callbackCount)")
-            return
-        }
-        var deviceBytes: UInt32 = 0
-        let deviceSizeStatus = AudioObjectGetPropertyDataSize(processID, &devicesAddress, 0, nil, &deviceBytes)
-        guard deviceSizeStatus == noErr else {
-            DiagnosticLog.write("CoreAudio process kAudioProcessPropertyDevices stage=\(stage): objectID=\(processID) pid=\(pid) bundleID=\(bundleID) scope=output; size query failed; \(statusDescription(deviceSizeStatus)); dataSize=\(deviceBytes); callbacks=\(callbackCount)")
-            return
-        }
-        guard deviceBytes % UInt32(MemoryLayout<AudioDeviceID>.size) == 0 else {
-            DiagnosticLog.write("CoreAudio process kAudioProcessPropertyDevices stage=\(stage): objectID=\(processID) pid=\(pid) bundleID=\(bundleID) scope=output; INVALID_SIZE; dataSize=\(deviceBytes); callbacks=\(callbackCount)")
-            return
-        }
-        guard deviceBytes > 0 else {
-            DiagnosticLog.write("CoreAudio process kAudioProcessPropertyDevices stage=\(stage): objectID=\(processID) pid=\(pid) bundleID=\(bundleID) scope=output; OSStatus 0; dataSize=0; outputDeviceIDs=[]; expectedDefaultOutputID=\(defaultOutputID); callbacks=\(callbackCount)")
-            return
-        }
-        var devices = [AudioDeviceID](repeating: AudioDeviceID(kAudioObjectUnknown), count: Int(deviceBytes) / MemoryLayout<AudioDeviceID>.size)
-        var returnedDeviceBytes = deviceBytes
-        let deviceStatus = devices.withUnsafeMutableBufferPointer { buffer in
-            AudioObjectGetPropertyData(processID, &devicesAddress, 0, nil, &returnedDeviceBytes, buffer.baseAddress!)
-        }
-        let validSize = returnedDeviceBytes % UInt32(MemoryLayout<AudioDeviceID>.size) == 0 && returnedDeviceBytes <= deviceBytes
-        let outputDeviceIDs = validSize ? Array(devices.prefix(Int(returnedDeviceBytes) / MemoryLayout<AudioDeviceID>.size)) : []
-        let result = deviceStatus == noErr ? (validSize ? String(describing: outputDeviceIDs) : "INVALID_SIZE") : "QUERY_FAILED"
-        DiagnosticLog.write("CoreAudio process kAudioProcessPropertyDevices stage=\(stage): objectID=\(processID) pid=\(pid) bundleID=\(bundleID) scope=output; \(statusDescription(deviceStatus)); dataSize=\(returnedDeviceBytes); outputDeviceIDs=\(result); expectedDefaultOutputID=\(defaultOutputID); callbacks=\(callbackCount)")
     }
 
     @discardableResult
@@ -575,8 +435,9 @@ final class AudioTapEngine: @unchecked Sendable {
                     DiagnosticLog.write("CLEANUP INCOMPLETE: aggregate is retained in lifecycle state but its ID is unavailable")
                     return false
                 }
+                DiagnosticLog.write("CoreAudio AudioHardwareDestroyAggregateDevice begin; monotonicNs=\(DispatchTime.now().uptimeNanoseconds); aggregateID=\(id)")
                 let status = AudioHardwareDestroyAggregateDevice(id)
-                DiagnosticLog.write("CoreAudio AudioHardwareDestroyAggregateDevice: \(statusDescription(status)); aggregateID=\(id)")
+                DiagnosticLog.write("CoreAudio AudioHardwareDestroyAggregateDevice returned \(statusDescription(status)); monotonicNs=\(DispatchTime.now().uptimeNanoseconds); aggregateID=\(id)")
                 guard status == noErr else {
                     lastCleanupFailure = "AudioHardwareDestroyAggregateDevice returned \(statusDescription(status))"
                     cleanupLifecycle.operationFailed(.destroyAggregate)
@@ -629,12 +490,14 @@ final class AudioTapEngine: @unchecked Sendable {
     }
 
     func isStillOnDefaultOutput() -> Bool {
-        guard let output = try? defaultOutputDevice(),
-              let currentUID = try? stringProperty(kAudioDevicePropertyDeviceUID, on: output, name: "output device UID") else {
+        guard let output = try? resolveDefaultOutputSnapshot() else {
             return false
         }
-        return currentUID == deviceUID
+        return output.snapshot.identity.deviceID == defaultOutputID &&
+            output.snapshot.identity.uid == deviceUID && output.snapshot.isAlive
     }
+
+    var outputDeviceID: AudioDeviceID { defaultOutputID }
 
     deinit { stop() }
 }

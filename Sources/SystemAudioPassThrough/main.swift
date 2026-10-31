@@ -127,7 +127,6 @@ timer.setEventHandler {
     let now = Date()
     let callbacks = engine.callbackCount
     engine.logAggregateRunningState(stage: "active-route watchdog poll")
-    engine.logBrowserHelperOutputState(stage: "active-route watchdog poll")
     if callbacks > 0 && !firstCallbackLogged {
         firstCallbackLogged = true
         DiagnosticLog.write(String(format: "first callback observed: elapsedSinceMetricsStartMs=%.3f callbacks=%llu inputPeak=%.6f outputPeak=%.6f; captureAuthorization=indeterminate (observed data is not a permission-status query)", engine.firstCallbackElapsedMilliseconds, callbacks, engine.inputPeak, engine.outputPeak))

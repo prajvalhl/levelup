@@ -8,7 +8,8 @@ TRIPLE="arm64-apple-macosx14.4"
 APP="$ROOT/.build/LevelUp.app"
 EXECUTABLE="$APP/Contents/MacOS/SystemAudioPassThrough"
 OUTPUT_DIR="$ROOT/release"
-DMG="$OUTPUT_DIR/LevelUp.dmg"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/Info.plist")"
+DMG="$OUTPUT_DIR/LevelUp-v$VERSION.dmg"
 STAGE="$ROOT/.build/release-staging.$$"
 MOUNT="$ROOT/.build/release-mount.$$"
 MOUNTED=0
@@ -23,6 +24,8 @@ trap cleanup EXIT
 
 echo "Running ARM64 macOS test suite..."
 swift test --triple "$TRIPLE"
+
+[[ ! -e "$DMG" ]] || { echo "error: refusing to overwrite existing release artifact: $DMG" >&2; exit 1; }
 
 echo "Building and verifying the app bundle..."
 "$ROOT/scripts/build-app.sh"
@@ -47,8 +50,7 @@ ditto "$APP" "$STAGE/LevelUp.app"
 cmp "$APP/Contents/Resources/LevelUp.icns" "$STAGE/LevelUp.app/Contents/Resources/LevelUp.icns"
 ln -s /Applications "$STAGE/Applications"
 
-rm -f "$DMG"
-hdiutil create -volname "LevelUp" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+hdiutil create -volname "LevelUp" -srcfolder "$STAGE" -format UDZO "$DMG"
 hdiutil verify "$DMG"
 
 hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT" -quiet
@@ -69,4 +71,5 @@ echo "Architecture: $ARCHS"
 echo "Bundle ID: $BUNDLE_ID"
 echo "Minimum macOS: $MINIMUM_OS"
 echo "Signature: ad-hoc only; not Developer ID signed or notarized"
+echo "Version: $VERSION"
 du -h "$DMG"
