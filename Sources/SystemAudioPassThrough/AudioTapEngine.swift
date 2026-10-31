@@ -41,6 +41,7 @@ final class AudioTapEngine: @unchecked Sendable {
     private var defaultOutputID = AudioDeviceID(kAudioObjectUnknown)
     private let dspMode: DSPMode
     private let startupCancellationReason: () -> String?
+    private let expectedOutputIdentity: OutputDeviceIdentity?
 
     private(set) var deviceName = ""
     private(set) var deviceUID = ""
@@ -49,11 +50,15 @@ final class AudioTapEngine: @unchecked Sendable {
     private(set) var bufferFrames: UInt32 = 0
     private(set) var tapDescription = ""
     private(set) var tapUID = ""
+    private(set) var outputIdentity: OutputDeviceIdentity?
     private(set) var started = false
     private(set) var lastCleanupFailure: String?
 
-    init(dspMode: DSPMode = .bypass, startupCancellationReason: @escaping () -> String? = { nil }) {
+    init(dspMode: DSPMode = .bypass,
+         expectedOutputIdentity: OutputDeviceIdentity? = nil,
+         startupCancellationReason: @escaping () -> String? = { nil }) {
         self.dspMode = dspMode
+        self.expectedOutputIdentity = expectedOutputIdentity
         self.startupCancellationReason = startupCancellationReason
     }
 
@@ -66,12 +71,17 @@ final class AudioTapEngine: @unchecked Sendable {
         do {
             // Resolve the destination before creating a muted tap. If there is
             // no usable default output, fail without muting any source process.
-            let output = try defaultOutputDevice()
+            let resolvedOutput = try resolveDefaultOutputSnapshot()
+            let output = AudioDeviceID(resolvedOutput.snapshot.identity.deviceID)
+            if let expectedOutputIdentity, expectedOutputIdentity != resolvedOutput.snapshot.identity {
+                throw AudioDeviceError.startupCancelled("the default output changed after it was validated")
+            }
+            outputIdentity = resolvedOutput.snapshot.identity
             defaultOutputID = output
-            deviceName = try stringProperty(kAudioObjectPropertyName, on: output, name: "output device name")
-            deviceUID = try stringProperty(kAudioDevicePropertyDeviceUID, on: output, name: "output device UID")
-            rate = try sampleRate(of: output)
-            let physicalFormat = try outputFormat(of: output)
+            deviceName = resolvedOutput.snapshot.name
+            deviceUID = resolvedOutput.snapshot.identity.uid
+            rate = resolvedOutput.snapshot.nominalSampleRate
+            let physicalFormat = resolvedOutput.format
             guard physicalFormat.mChannelsPerFrame > 0,
                   (physicalFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
                   physicalFormat.mBitsPerChannel == 32 else {
@@ -268,6 +278,12 @@ final class AudioTapEngine: @unchecked Sendable {
             guard let ioProcID else { throw AudioDeviceError.osStatus("create aggregate IO callback", -1) }
             DiagnosticLog.write("CoreAudio IOProc confirmed created: aggregateID=\(aggregateID), IOProcID=\(String(describing: ioProcID))")
             markStartupStage("IOProc registered on aggregate device")
+            if let expectedOutputIdentity {
+                let latest = try resolveDefaultOutputSnapshot()
+                guard latest.snapshot.identity == expectedOutputIdentity else {
+                    throw AudioDeviceError.startupCancelled("the default output changed before AudioDeviceStart")
+                }
+            }
             audioDeviceStartAttemptNanoseconds = DispatchTime.now().uptimeNanoseconds
             logAggregateRunningState(stage: "immediately before AudioDeviceStart")
             logBrowserHelperOutputState(stage: "immediately before AudioDeviceStart")
@@ -330,6 +346,21 @@ final class AudioTapEngine: @unchecked Sendable {
             elapsedMilliseconds = -1
         }
         DiagnosticLog.write(String(format: "CoreAudio aggregate running-state query stage=%@ aggregateID=%u: %@; dataSize=%u; running=%@; elapsedSinceAudioDeviceStartAttemptMs=%.3f; callbacks=%llu", stage, aggregateID, statusDescription(status), dataSize, runningValue, elapsedMilliseconds, callbackCount))
+    }
+
+    func aggregateIsRunning() -> Bool? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunning,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(aggregateID, &address, 0, nil, &size, &running)
+        guard status == noErr, size == UInt32(MemoryLayout<UInt32>.size), running <= 1 else {
+            DiagnosticLog.write("CoreAudio aggregate health query kAudioDevicePropertyDeviceIsRunning aggregateID=\(aggregateID): \(statusDescription(status)); dataSize=\(size); value=\(running); callbacks=\(callbackCount)")
+            return nil
+        }
+        DiagnosticLog.write("CoreAudio aggregate health query kAudioDevicePropertyDeviceIsRunning aggregateID=\(aggregateID): \(statusDescription(status)); dataSize=\(size); value=\(running); callbacks=\(callbackCount)")
+        return running == 1
     }
 
     /// Reads the tap's actual description through Apple's throwing AudioHardwareTap
@@ -629,12 +660,14 @@ final class AudioTapEngine: @unchecked Sendable {
     }
 
     func isStillOnDefaultOutput() -> Bool {
-        guard let output = try? defaultOutputDevice(),
-              let currentUID = try? stringProperty(kAudioDevicePropertyDeviceUID, on: output, name: "output device UID") else {
+        guard let output = try? resolveDefaultOutputSnapshot() else {
             return false
         }
-        return currentUID == deviceUID
+        return output.snapshot.identity.deviceID == defaultOutputID &&
+            output.snapshot.identity.uid == deviceUID && output.snapshot.isAlive
     }
+
+    var outputDeviceID: AudioDeviceID { defaultOutputID }
 
     deinit { stop() }
 }

@@ -2,6 +2,7 @@ import CoreAudio
 import CoreFoundation
 import Darwin
 import Foundation
+import PrototypeSupport
 
 enum AudioDeviceError: Error, CustomStringConvertible {
     case osStatus(String, OSStatus)
@@ -50,6 +51,103 @@ func defaultOutputDevice() throws -> AudioDeviceID {
         throw AudioDeviceError.unknownDefaultOutput(processID: getpid())
     }
     return device
+}
+
+struct ResolvedOutputDevice {
+    let snapshot: OutputDeviceSnapshot
+    let format: AudioStreamBasicDescription
+}
+
+func allAudioDeviceIDs() throws -> [AudioDeviceID] {
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                             mScope: kAudioObjectPropertyScopeGlobal,
+                                             mElement: kAudioObjectPropertyElementMain)
+    var byteCount: UInt32 = 0
+    try check(AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &byteCount),
+              "read Core Audio device-list size")
+    guard byteCount % UInt32(MemoryLayout<AudioDeviceID>.size) == 0 else {
+        throw AudioDeviceError.osStatus("Core Audio device list has invalid size \(byteCount)", -1)
+    }
+    guard byteCount > 0 else { return [] }
+    var ids = [AudioDeviceID](repeating: AudioDeviceID(kAudioObjectUnknown),
+                              count: Int(byteCount) / MemoryLayout<AudioDeviceID>.size)
+    let allocatedBytes = byteCount
+    let status = ids.withUnsafeMutableBufferPointer { buffer in
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &byteCount, buffer.baseAddress!)
+    }
+    try check(status, "read Core Audio device list")
+    guard byteCount <= allocatedBytes, byteCount % UInt32(MemoryLayout<AudioDeviceID>.size) == 0 else {
+        throw AudioDeviceError.osStatus("Core Audio returned invalid device-list size \(byteCount)", -1)
+    }
+    return Array(ids.prefix(Int(byteCount) / MemoryLayout<AudioDeviceID>.size))
+}
+
+func deviceIsAlive(_ deviceID: AudioDeviceID) throws -> Bool {
+    var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsAlive,
+                                             mScope: kAudioObjectPropertyScopeGlobal,
+                                             mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectHasProperty(AudioObjectID(deviceID), &address) else {
+        throw AudioDeviceError.osStatus("default output does not expose kAudioDevicePropertyDeviceIsAlive", kAudioHardwareUnknownPropertyError)
+    }
+    var alive: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(AudioObjectID(deviceID), &address, 0, nil, &size, &alive)
+    DiagnosticLog.write("CoreAudio kAudioDevicePropertyDeviceIsAlive deviceID=\(deviceID): \(statusDescription(status)); dataSize=\(size); value=\(alive)")
+    try check(status, "read output device alive state")
+    guard size == UInt32(MemoryLayout<UInt32>.size), alive <= 1 else {
+        throw AudioDeviceError.osStatus("kAudioDevicePropertyDeviceIsAlive returned invalid size/value (size=\(size), value=\(alive))", -1)
+    }
+    return alive == 1
+}
+
+func resolveDefaultOutputSnapshot() throws -> ResolvedOutputDevice {
+    let deviceID = try defaultOutputDevice()
+    let devices = try allAudioDeviceIDs()
+    let alive = try deviceIsAlive(deviceID)
+    let name = try stringProperty(kAudioObjectPropertyName, on: AudioObjectID(deviceID), name: "output device name")
+    let uid = try stringProperty(kAudioDevicePropertyDeviceUID, on: AudioObjectID(deviceID), name: "output device UID")
+    let rate = try sampleRate(of: AudioObjectID(deviceID))
+    let streams = try streamIDs(of: AudioObjectID(deviceID), scope: kAudioDevicePropertyScopeOutput, direction: "physical output")
+    guard let format = try outputStreamFormat(streams) else { throw AudioDeviceError.noOutputStreams }
+    let fingerprint = "\(format.mSampleRate)|\(format.mFormatID)|\(format.mFormatFlags)|\(format.mChannelsPerFrame)|\(format.mBitsPerChannel)"
+    let snapshot = OutputDeviceSnapshot(identity: OutputDeviceIdentity(deviceID: deviceID,
+                                                                       uid: uid,
+                                                                       formatFingerprint: fingerprint),
+                                        name: name,
+                                        isInDeviceList: devices.contains(deviceID),
+                                        isAlive: alive,
+                                        outputStreamCount: streams.count,
+                                        nominalSampleRate: rate,
+                                        channelCount: format.mChannelsPerFrame,
+                                        isFloatPCM: format.mFormatID == kAudioFormatLinearPCM &&
+                                            (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+                                        bitsPerChannel: format.mBitsPerChannel)
+    guard snapshot.isUsable else {
+        throw AudioDeviceError.osStatus(snapshot.unavailableReason ?? "default output is unavailable", -1)
+    }
+    DiagnosticLog.write("resolved default output snapshot: ID=\(deviceID), UID=\(uid), name=\(name), alive=\(alive), streams=\(streams), nominalRate=\(rate), format={\(formatSummary(format))}")
+    return ResolvedOutputDevice(snapshot: snapshot, format: format)
+}
+
+func outputStreamFormat(_ streams: [AudioStreamID]) throws -> AudioStreamBasicDescription? {
+    guard !streams.isEmpty else { return nil }
+    var lastStatus: OSStatus = noErr
+    for stream in streams {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyVirtualFormat,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        lastStatus = AudioObjectGetPropertyData(AudioObjectID(stream), &address, 0, nil, &size, &format)
+        DiagnosticLog.write("CoreAudio output stream format streamID=\(stream): \(statusDescription(lastStatus)); dataSize=\(size); format={\(formatSummary(format))}")
+        if lastStatus == noErr {
+            guard size == UInt32(MemoryLayout<AudioStreamBasicDescription>.size) else {
+                throw AudioDeviceError.osStatus("output stream returned invalid format size \(size)", -1)
+            }
+            return format
+        }
+    }
+    throw AudioDeviceError.outputFormatFailure(lastStatus)
 }
 
 func stringProperty(_ selector: AudioObjectPropertySelector, on object: AudioObjectID, name: String) throws -> String {
