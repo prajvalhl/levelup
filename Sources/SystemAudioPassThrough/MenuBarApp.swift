@@ -48,9 +48,9 @@ final class LevelUpModel: ObservableObject {
     private var engine: AudioTapEngine?
     private var startupControl: StartupControl?
     private var activeMode: DSPMode?
-    private var cleanupPending = false
-    private var quitAfterCleanup = false
-    private var generation = 0
+    private var lifecycle = SessionLifecycleReducer()
+    private var cleanupPending: Bool { lifecycle.cleanupPending }
+    private var generation: Int { lifecycle.generation }
     private var routeMonitor: DispatchSourceTimer?
     private var outputCheckGate = OutputCheckGate()
     private var routeMonitorStartNanoseconds: UInt64 = 0
@@ -173,8 +173,7 @@ final class LevelUpModel: ObservableObject {
     }
 
     private func beginStart() {
-        generation += 1
-        let operation = generation
+        guard let operation = lifecycle.beginStart() else { return }
         let requestedMode = selectedDSPMode
         let control = StartupControl()
         let route = AudioTapEngine(dspMode: requestedMode,
@@ -223,6 +222,16 @@ final class LevelUpModel: ObservableObject {
 
     private func finishSuccessfulStart(operation: Int, mode: DSPMode, route: AudioTapEngine) {
         guard generation == operation else { return }
+        guard lifecycle.startupSucceeded(generation: operation) else {
+            // Stop or Quit can arrive after Core Audio startup returns but
+            // before this main-queue transition. The route is already live,
+            // so hand it to the serialized cleanup path instead of dropping it.
+            guard engine === route, !cleanupPending else { return }
+            lifecycle.beginCleanup()
+            state = .stopping
+            performCleanup(route: route, operation: operation, restartAfter: false)
+            return
+        }
         startupTimedOut = false
         activeMode = mode
         state = .running
@@ -314,14 +323,14 @@ final class LevelUpModel: ObservableObject {
                              cleanupFailure: String?) {
         guard generation == operation else { return }
         startupTimedOut = false
-        cleanupPending = !cleanupSucceeded
+        _ = lifecycle.startupFailed(generation: operation, cleanupSucceeded: cleanupSucceeded)
         if cleanupSucceeded {
             engine = nil
             startupControl = nil
             activeMode = nil
         }
-        if cleanupSucceeded && quitAfterCleanup {
-            quitAfterCleanup = false
+        if cleanupSucceeded && lifecycle.quitRequested {
+            _ = lifecycle.cleanupSucceeded(restartAfter: false)
             NSApp.terminate(nil)
         } else if pendingStop == "user requested stop" {
             state = cleanupSucceeded ? .stopped : .error(cleanupIncompleteMessage(cleanupFailure))
@@ -347,12 +356,14 @@ final class LevelUpModel: ObservableObject {
 
     func stop() {
         if case .starting = state {
+            lifecycle.requestStop()
             _ = startupControl?.requestStop("user requested stop")
             state = .stopping
             return
         }
         if case .running = state {
             guard let route = engine else { state = .error("Audio engine state was unavailable."); return }
+            lifecycle.requestStop()
             stopRouteMonitor()
             _ = startupControl?.requestStop("user requested stop")
             state = .stopping
@@ -360,13 +371,16 @@ final class LevelUpModel: ObservableObject {
             return
         }
         if cleanupPending, let route = engine {
+            lifecycle.requestStop()
             state = .stopping
+            lifecycle.beginCleanup()
             performCleanup(route: route, operation: generation, restartAfter: false)
         }
     }
 
     func applyChanges() {
         guard isRunning, hasPendingChanges, let route = engine else { return }
+        lifecycle.beginCleanup()
         stopRouteMonitor()
         _ = startupControl?.requestStop("apply updated DSP settings")
         state = .stopping
@@ -382,9 +396,7 @@ final class LevelUpModel: ObservableObject {
                     self.engine = nil
                     self.startupControl = nil
                     self.activeMode = nil
-                    self.cleanupPending = false
-                    switch SessionCleanupDecision.resolve(restartAfter: restartAfter,
-                                                          quitRequested: &self.quitAfterCleanup) {
+                    switch self.lifecycle.cleanupSucceeded(restartAfter: restartAfter) {
                     case .quit:
                         NSApp.terminate(nil)
                     case .restart:
@@ -398,7 +410,7 @@ final class LevelUpModel: ObservableObject {
                         }
                     }
                 } else {
-                    self.cleanupPending = true
+                    self.lifecycle.cleanupFailed()
                     self.state = .error(self.cleanupIncompleteMessage(route.lastCleanupFailure))
                 }
             }
@@ -406,22 +418,22 @@ final class LevelUpModel: ObservableObject {
     }
 
     func quit() {
+        lifecycle.requestQuit()
         switch state {
         case .stopped:
+            _ = lifecycle.cleanupSucceeded(restartAfter: false)
             NSApp.terminate(nil)
         case .starting:
-            quitAfterCleanup = true
             _ = startupControl?.requestStop("user requested quit")
             state = .stopping
         case .running:
-            quitAfterCleanup = true
             stop()
         case .stopping:
-            quitAfterCleanup = true
+            break
         case .error:
             if cleanupPending, let route = engine {
-                quitAfterCleanup = true
                 state = .stopping
+                lifecycle.beginCleanup()
                 performCleanup(route: route, operation: generation, restartAfter: false)
             } else {
                 NSApp.terminate(nil)
