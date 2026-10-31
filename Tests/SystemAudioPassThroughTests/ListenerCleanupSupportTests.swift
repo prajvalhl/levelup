@@ -94,6 +94,64 @@ final class ListenerCleanupSupportTests: XCTestCase {
         XCTAssertEqual(registrations.count, 0)
     }
 
+    func testActiveDeviceBadObjectErrorRetiresOnlyWhenDeviceListConfirmsAbsence() {
+        let disposition = ListenerRemovalPolicy.disposition(removalSucceeded: false,
+                                                            isActivePhysicalDeviceListener: true,
+                                                            returnedBadObjectError: true,
+                                                            deviceConfirmedAbsent: true)
+        XCTAssertEqual(disposition, .retiredConfirmedAbsentPhysicalDevice)
+        var registrations = ListenerRegistrationStore<String, Int>()
+        registrations.insert(83, forKey: "active-alive")
+        registrations.removeValue(forKey: "active-alive", removalSucceeded: disposition != .retainForRetry)
+        XCTAssertEqual(registrations.count, 0)
+
+        XCTAssertEqual(ListenerRemovalPolicy.disposition(removalSucceeded: false,
+                                                           isActivePhysicalDeviceListener: true,
+                                                           returnedBadObjectError: true,
+                                                           deviceConfirmedAbsent: false),
+                       .retainForRetry)
+    }
+
+    func testNonBadObjectFailureIsRetainedEvenWhenDeviceIsAbsent() {
+        XCTAssertEqual(ListenerRemovalPolicy.disposition(removalSucceeded: false,
+                                                           isActivePhysicalDeviceListener: true,
+                                                           returnedBadObjectError: false,
+                                                           deviceConfirmedAbsent: true),
+                       .retainForRetry)
+    }
+
+    func testSystemListenerBadObjectFailureRemainsRetryable() {
+        let disposition = ListenerRemovalPolicy.disposition(removalSucceeded: false,
+                                                            isActivePhysicalDeviceListener: false,
+                                                            returnedBadObjectError: true,
+                                                            deviceConfirmedAbsent: true)
+        XCTAssertEqual(disposition, .retainForRetry)
+        var registrations = ListenerRegistrationStore<String, Int>()
+        registrations.insert(1, forKey: "system-default-output")
+        registrations.removeValue(forKey: "system-default-output", removalSucceeded: disposition != .retainForRetry)
+        XCTAssertEqual(registrations.count, 1)
+    }
+
+    func testSuccessfulListenerRemovalKeepsNormalSuccessPath() {
+        XCTAssertEqual(ListenerRemovalPolicy.disposition(removalSucceeded: true,
+                                                           isActivePhysicalDeviceListener: true,
+                                                           returnedBadObjectError: false,
+                                                           deviceConfirmedAbsent: false),
+                       .removed)
+    }
+
+    func testRetiredDeviceTokenCannotAcceptAlreadyQueuedCallback() {
+        let retiredToken = UUID()
+        XCTAssertFalse(ListenerEventGate.accepts(sessionActive: true,
+                                                 eventSessionEpoch: 12,
+                                                 currentSessionEpoch: 12,
+                                                 isActiveDeviceEvent: true,
+                                                 eventToken: retiredToken,
+                                                 activeDeviceToken: nil,
+                                                 eventRouteGeneration: 7,
+                                                 currentRouteGeneration: 7))
+    }
+
     func testLateEventWithOldListenerTokenIsRejected() {
         let oldToken = UUID()
         let currentToken = UUID()

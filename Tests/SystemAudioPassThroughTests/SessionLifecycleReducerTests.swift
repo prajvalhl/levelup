@@ -21,6 +21,23 @@ final class SessionLifecycleReducerTests: XCTestCase {
         XCTAssertNil(reducer.beginRecoveryAttempt())
     }
 
+    func testQuitRemainsPendingWhileCleanupIsIncompleteAndCompletesAfterRetry() {
+        var reducer = runningReducer()
+        reducer.beginCleanup(reason: .outputRecovery)
+        reducer.requestQuit()
+        reducer.cleanupFailed(reason: .outputRecovery)
+
+        XCTAssertEqual(reducer.intent, .quit)
+        XCTAssertTrue(reducer.cleanupPending)
+        XCTAssertEqual(reducer.pendingCleanupReason, .quit)
+        XCTAssertNil(reducer.beginStart())
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .quit), .quit)
+        XCTAssertFalse(reducer.cleanupPending)
+        XCTAssertEqual(reducer.intent, .quit)
+    }
+
     func testSleepDuringStartupSuppressesCompletionAndRecovery() {
         var reducer = SessionLifecycleReducer()
         let startingGeneration = try! XCTUnwrap(reducer.beginStart())

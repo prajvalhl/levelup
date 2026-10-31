@@ -141,13 +141,31 @@ final class CoreAudioOutputListeners: @unchecked Sendable {
                                                                 &address,
                                                                 deliveryQueue,
                                                                 registration.listener)
-            DiagnosticLog.write("CoreAudio AudioObjectRemovePropertyListenerBlock kind=\(registration.kind) objectID=\(registration.objectID) selector=\(address.mSelector): \(statusDescription(status)); token=\(registration.token)")
-            registrations.removeValue(forKey: registration.token, removalSucceeded: status == noErr)
-            if status != noErr {
+            var confirmedAbsentPhysicalDevice = false
+            if status == kAudioHardwareBadObjectError, registration.kind == .activeAlive {
+                do {
+                    let devices = try allAudioDeviceIDs()
+                    confirmedAbsentPhysicalDevice = !devices.contains(AudioDeviceID(registration.objectID))
+                    DiagnosticLog.write("CoreAudio active-device listener absence check objectID=\(registration.objectID): confirmedAbsent=\(confirmedAbsentPhysicalDevice); enumeratedDeviceCount=\(devices.count)")
+                } catch {
+                    DiagnosticLog.write("CoreAudio active-device listener absence check objectID=\(registration.objectID) failed: \(error); registration retained")
+                }
+            }
+            let disposition = ListenerRemovalPolicy.disposition(
+                removalSucceeded: status == noErr,
+                isActivePhysicalDeviceListener: registration.kind == .activeAlive,
+                returnedBadObjectError: status == kAudioHardwareBadObjectError,
+                deviceConfirmedAbsent: confirmedAbsentPhysicalDevice
+            )
+            DiagnosticLog.write("CoreAudio AudioObjectRemovePropertyListenerBlock kind=\(registration.kind) objectID=\(registration.objectID) selector=\(address.mSelector): \(statusDescription(status)); disposition=\(disposition); token=\(registration.token)")
+            registrations.removeValue(forKey: registration.token, removalSucceeded: disposition != .retainForRetry)
+            if disposition == .retainForRetry {
                 failures.append("AudioObjectRemovePropertyListenerBlock for \(registration.kind) returned \(statusDescription(status))")
             }
-            // On failure keep the exact block, queue, object and address so a
-            // later removal can be retried and late events remain identifiable.
+            // On unresolved failure keep the exact block, queue, object and
+            // address so removal can be retried. A confirmed-absent physical
+            // device has no live object on which this registration can fire;
+            // currentActiveToken is invalidated by removeActiveDeviceListener.
         }
         return failures
     }

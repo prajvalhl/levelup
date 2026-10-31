@@ -73,6 +73,29 @@ public struct ListenerRegistrationStore<Key: Hashable, Value> {
     }
 }
 
+public enum ListenerRemovalDisposition: Equatable, Sendable {
+    case removed
+    case retiredConfirmedAbsentPhysicalDevice
+    case retainForRetry
+}
+
+/// A narrowly scoped exception for active physical-device listeners: Core
+/// Audio's bad-object result permits retirement only when the object is also
+/// confirmed absent from the current device list. System listeners never use
+/// this exception.
+public enum ListenerRemovalPolicy {
+    public static func disposition(removalSucceeded: Bool,
+                                   isActivePhysicalDeviceListener: Bool,
+                                   returnedBadObjectError: Bool,
+                                   deviceConfirmedAbsent: Bool) -> ListenerRemovalDisposition {
+        if removalSucceeded { return .removed }
+        if isActivePhysicalDeviceListener && returnedBadObjectError && deviceConfirmedAbsent {
+            return .retiredConfirmedAbsentPhysicalDevice
+        }
+        return .retainForRetry
+    }
+}
+
 /// Pure token validation shared by the model and regression tests.
 public enum ListenerEventGate {
     public static func accepts(sessionActive: Bool,
