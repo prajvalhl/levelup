@@ -181,9 +181,9 @@ final class AudioTapEngine: @unchecked Sendable {
                 ]]
             ]
             DiagnosticLog.write("aggregate creation requested: name=LevelUp Pass Through Proof of Concept, UID=\(aggregateUID), outputDeviceUID=\(deviceUID), tapUID=\(tapUID), tapAutoStart=true (installed SDK: start waits for the first tap receiving audio)")
-            DiagnosticLog.write(String(format: "CoreAudio AudioHardwareCreateAggregateDevice begin; elapsedMs=%.3f", startupElapsedMilliseconds))
+            DiagnosticLog.write("CoreAudio AudioHardwareCreateAggregateDevice begin; monotonicNs=\(DispatchTime.now().uptimeNanoseconds); elapsedMs=\(startupElapsedMilliseconds); requestedUID=\(aggregateUID)")
             let aggregateStatus = AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &aggregateID)
-            DiagnosticLog.write(String(format: "CoreAudio AudioHardwareCreateAggregateDevice returned %@; elapsedMs=%.3f; aggregateDeviceID=%u", statusDescription(aggregateStatus), startupElapsedMilliseconds, aggregateID))
+            DiagnosticLog.write("CoreAudio AudioHardwareCreateAggregateDevice returned \(statusDescription(aggregateStatus)); monotonicNs=\(DispatchTime.now().uptimeNanoseconds); elapsedMs=\(startupElapsedMilliseconds); aggregateDeviceID=\(aggregateID); requestedUID=\(aggregateUID)")
             if aggregateID != AudioObjectID(kAudioObjectUnknown) { cleanupLifecycle.aggregateCreated() }
             try check(aggregateStatus, "create private aggregate device")
             try checkStartupCancellation("after aggregate-device creation")
@@ -313,7 +313,7 @@ final class AudioTapEngine: @unchecked Sendable {
 
     private func checkStartupCancellation(_ stage: String) throws {
         guard let reason = startupCancellationReason() else { return }
-        DiagnosticLog.write("startup cancellation observed at \(stage); reason=\(reason); beginning ordered cleanup")
+        DiagnosticLog.write("startup cancellation observed; monotonicNs=\(DispatchTime.now().uptimeNanoseconds); stage=\(stage); reason=\(reason); expectedOutput=\(String(describing: expectedOutputIdentity)); resolvedOutput=\(String(describing: outputIdentity)); beginning ordered cleanup")
         throw AudioDeviceError.startupCancelled(reason)
     }
 
@@ -606,8 +606,9 @@ final class AudioTapEngine: @unchecked Sendable {
                     DiagnosticLog.write("CLEANUP INCOMPLETE: aggregate is retained in lifecycle state but its ID is unavailable")
                     return false
                 }
+                DiagnosticLog.write("CoreAudio AudioHardwareDestroyAggregateDevice begin; monotonicNs=\(DispatchTime.now().uptimeNanoseconds); aggregateID=\(id)")
                 let status = AudioHardwareDestroyAggregateDevice(id)
-                DiagnosticLog.write("CoreAudio AudioHardwareDestroyAggregateDevice: \(statusDescription(status)); aggregateID=\(id)")
+                DiagnosticLog.write("CoreAudio AudioHardwareDestroyAggregateDevice returned \(statusDescription(status)); monotonicNs=\(DispatchTime.now().uptimeNanoseconds); aggregateID=\(id)")
                 guard status == noErr else {
                     lastCleanupFailure = "AudioHardwareDestroyAggregateDevice returned \(statusDescription(status))"
                     cleanupLifecycle.operationFailed(.destroyAggregate)

@@ -1,5 +1,25 @@
 import Foundation
 
+/// Output notifications have different implications during recovery startup.
+/// Device-list changes invalidate settling, but do not alone prove that the
+/// selected physical output changed.
+public enum RecoveryOutputEventKind: Equatable, Sendable {
+    case defaultOutputChanged
+    case deviceListChanged
+    case activeDeviceAliveChanged
+}
+
+public enum RecoveryOutputEventPolicy {
+    public static func cancelsConnectingStartup(for event: RecoveryOutputEventKind) -> Bool {
+        switch event {
+        case .defaultOutputChanged, .activeDeviceAliveChanged:
+            return true
+        case .deviceListChanged:
+            return false
+        }
+    }
+}
+
 public struct OutputDeviceIdentity: Equatable, Sendable {
     public let deviceID: UInt32
     public let uid: String

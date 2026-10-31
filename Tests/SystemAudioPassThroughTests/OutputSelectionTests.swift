@@ -18,6 +18,29 @@ final class OutputSelectionTests: XCTestCase {
         XCTAssertFalse(gate.observe(current, revision: 4))
     }
 
+    func testDeviceListNotificationDuringSettlingRequiresFreshSnapshots() {
+        var gate = OutputDeviceStabilityGate()
+        let current = snapshot(id: 8, uid: "speaker")
+        XCTAssertFalse(gate.observe(current, revision: 3))
+        XCTAssertTrue(gate.observe(current, revision: 3))
+
+        // An accepted device-list event advances the shared revision. Results
+        // collected before it can no longer satisfy the settling gate.
+        gate.invalidate(revision: 4)
+        XCTAssertFalse(gate.accepts(revision: 3))
+        XCTAssertFalse(gate.observe(current, revision: 4))
+        XCTAssertTrue(gate.observe(current, revision: 4))
+    }
+
+    func testChangedPhysicalOutputIdentityStillRequiresRouteReplacement() {
+        let previous = snapshot(id: 71, uid: "BuiltInSpeakerDevice").identity
+        let newlyResolved = snapshot(id: 144, uid: "98-47-44-02-D8-8B").identity
+
+        XCTAssertTrue(snapshot(id: 144, uid: "98-47-44-02-D8-8B")
+            .requiresRouteReplacement(comparedTo: previous))
+        XCTAssertNotEqual(previous, newlyResolved)
+    }
+
     func testInvalidTemporarySnapshotResetsStability() {
         var gate = OutputDeviceStabilityGate()
         XCTAssertFalse(gate.observe(snapshot(id: 3, uid: "bt"), revision: 1))

@@ -235,6 +235,7 @@ final class LevelUpModel: ObservableObject {
         recoverySnapshot = nil
         outputStabilityGate.invalidate(revision: lifecycle.outputEventRevision)
         state = .waitingForOutput
+        DiagnosticLog.write("recovery.attempt.begin monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) outputEventRevision=\(lifecycle.outputEventRevision) expectedOutput=unresolved currentDefault=queued-for-audioQueue")
         resolveOutputForRecovery(operation: operation, revision: lifecycle.outputEventRevision)
     }
 
@@ -242,6 +243,9 @@ final class LevelUpModel: ObservableObject {
                              expectedOutput: OutputDeviceSnapshot?,
                              recovery: Bool) {
         isRecoveryStart = recovery
+        if recovery {
+            DiagnosticLog.write("recovery.startup.begin monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) outputEventRevision=\(lifecycle.outputEventRevision) expectedOutput=\(Self.outputIdentityDescription(expectedOutput?.identity))")
+        }
         let requestedMode = selectedDSPMode
         let control = StartupControl()
         let route = AudioTapEngine(dspMode: requestedMode,
@@ -432,47 +436,132 @@ final class LevelUpModel: ObservableObject {
         let isActiveDeviceEvent: Bool
         if case .activeDeviceAliveChanged = event { isActiveDeviceEvent = true }
         else { isActiveDeviceEvent = false }
-        guard ListenerEventGate.accepts(sessionActive: listenerSessionActive,
-                                        eventSessionEpoch: sessionEpoch,
-                                        currentSessionEpoch: listenerSessionEpoch,
-                                        isActiveDeviceEvent: isActiveDeviceEvent,
-                                        eventToken: listenerToken,
-                                        activeDeviceToken: activeDeviceListenerToken,
-                                        eventRouteGeneration: routeGeneration,
-                                        currentRouteGeneration: generation) else { return }
+        let revisionBefore = lifecycle.outputEventRevision
+        let stateBefore = Self.lifecycleStateName(state)
+        let sessionIsCurrent = listenerSessionActive && sessionEpoch == listenerSessionEpoch
+        let tokenIsCurrent = !isActiveDeviceEvent || listenerToken == activeDeviceListenerToken
+        let routeGenerationIsCurrent = !isActiveDeviceEvent || routeGeneration == generation
+        let accepted = ListenerEventGate.accepts(sessionActive: listenerSessionActive,
+                                                 eventSessionEpoch: sessionEpoch,
+                                                 currentSessionEpoch: listenerSessionEpoch,
+                                                 isActiveDeviceEvent: isActiveDeviceEvent,
+                                                 eventToken: listenerToken,
+                                                 activeDeviceToken: activeDeviceListenerToken,
+                                                 eventRouteGeneration: routeGeneration,
+                                                 currentRouteGeneration: generation)
+        guard accepted else {
+            DiagnosticLog.write("recovery.output-event monotonicNs=\(DispatchTime.now().uptimeNanoseconds) kind=\(Self.outputEventKind(event)) sessionEpoch=\(sessionEpoch) currentSessionEpoch=\(listenerSessionEpoch) listenerToken=\(listenerToken) routeGeneration=\(String(describing: routeGeneration)) lifecycleGeneration=\(generation) stateBefore=\(stateBefore) stateAfter=\(Self.lifecycleStateName(state)) recoveryAttempt=\(lifecycle.recoveryAttempts) revisionBefore=\(revisionBefore) revisionAfter=\(lifecycle.outputEventRevision) accepted=false rejectedAsStale=true sessionCurrent=\(sessionIsCurrent) tokenCurrent=\(tokenIsCurrent) routeGenerationCurrent=\(routeGenerationIsCurrent) settlingInvalidated=false startupCancellationRequested=false action=none")
+            return
+        }
+
         _ = lifecycle.advanceOutputEventRevision()
+        var settlingInvalidated = false
+        var startupCancellationRequested = false
+        var immediateCleanupScheduled = false
+        var requestedCancellationReason: String?
+        var effectiveCancellationReason: String?
+        var action = "observed"
         if recoveryIsActive {
             outputStabilityGate.invalidate(revision: lifecycle.outputEventRevision)
+            settlingInvalidated = true
             if case .starting = state, isRecoveryStart {
-                _ = startupControl?.requestStop("output changed during recovery")
+                if RecoveryOutputEventPolicy.cancelsConnectingStartup(for: Self.recoveryEventKind(event)) {
+                    let reason = "output changed during recovery"
+                    requestedCancellationReason = reason
+                    let requestResult = startupControl?.requestStop(reason)
+                    startupCancellationRequested = startupControl != nil
+                    immediateCleanupScheduled = requestResult == true
+                    effectiveCancellationReason = startupControl?.cancellationReason()
+                    action = "startup_cancellation_requested"
+                } else {
+                    action = "startup_preserved_device_list_event"
+                }
             } else if case .connecting = state {
-                _ = startupControl?.requestStop("output changed during recovery")
+                if RecoveryOutputEventPolicy.cancelsConnectingStartup(for: Self.recoveryEventKind(event)) {
+                    let reason = "output changed during recovery"
+                    requestedCancellationReason = reason
+                    let requestResult = startupControl?.requestStop(reason)
+                    startupCancellationRequested = startupControl != nil
+                    immediateCleanupScheduled = requestResult == true
+                    effectiveCancellationReason = startupControl?.cancellationReason()
+                    action = "startup_cancellation_requested"
+                } else {
+                    action = "startup_preserved_device_list_event"
+                }
             } else if case .waitingForOutput = state, let recoveryAttemptGeneration {
                 scheduleRecoveryResolution(operation: recoveryAttemptGeneration,
                                            revision: lifecycle.outputEventRevision,
                                            after: outputSettleInterval)
+                action = "recovery_snapshot_rescheduled"
             } else if isRunning, let route = engine {
                 reconcileOutput(route: route, operation: generation)
+                action = "running_route_reconciled"
+            } else {
+                action = "recovery_event_recorded"
             }
-            return
-        }
-        guard case .recoveryFailed = state else {
+        } else if case .recoveryFailed = state {
+            // Exhaustion is terminal until the user explicitly retries.
+            action = "recovery_failed_no_automatic_retry"
+        } else {
             if isRunning, let route = engine {
                 reconcileOutput(route: route, operation: generation)
+                action = "running_route_reconciled"
             } else if case .starting = state, event == .defaultOutputChanged {
                 _ = lifecycle.requestOutputRecovery()
                 recoveryIsActive = true
                 recoveryFailureMessage = "The default output changed during startup."
-                _ = startupControl?.requestStop("default output changed during startup")
+                let reason = "default output changed during startup"
+                requestedCancellationReason = reason
+                let requestResult = startupControl?.requestStop(reason)
+                startupCancellationRequested = startupControl != nil
+                immediateCleanupScheduled = requestResult == true
+                effectiveCancellationReason = startupControl?.cancellationReason()
                 state = .recovering
+                action = "startup_cancellation_requested"
             }
-            return
         }
-        // Exhaustion is terminal until the user explicitly retries.
+
+        DiagnosticLog.write("recovery.output-event monotonicNs=\(DispatchTime.now().uptimeNanoseconds) kind=\(Self.outputEventKind(event)) sessionEpoch=\(sessionEpoch) listenerToken=\(listenerToken) routeGeneration=\(String(describing: routeGeneration)) lifecycleGeneration=\(generation) stateBefore=\(stateBefore) stateAfter=\(Self.lifecycleStateName(state)) recoveryAttempt=\(lifecycle.recoveryAttempts) revisionBefore=\(revisionBefore) revisionAfter=\(lifecycle.outputEventRevision) accepted=true rejectedAsStale=false settlingInvalidated=\(settlingInvalidated) startupCancellationRequested=\(startupCancellationRequested) requestedCancellationReason=\(requestedCancellationReason ?? "<none>") effectiveCancellationReason=\(effectiveCancellationReason ?? "<none>") immediateCleanupScheduled=\(immediateCleanupScheduled) action=\(action)")
+    }
+
+    private static func outputEventKind(_ event: CoreAudioOutputEvent) -> String {
+        switch event {
+        case .defaultOutputChanged: return "default_output"
+        case .deviceListChanged: return "device_list"
+        case let .activeDeviceAliveChanged(deviceID): return "active_device_alive(deviceID:\(deviceID))"
+        }
+    }
+
+    private static func recoveryEventKind(_ event: CoreAudioOutputEvent) -> RecoveryOutputEventKind {
+        switch event {
+        case .defaultOutputChanged: return .defaultOutputChanged
+        case .deviceListChanged: return .deviceListChanged
+        case .activeDeviceAliveChanged: return .activeDeviceAliveChanged
+        }
+    }
+
+    private static func outputIdentityDescription(_ identity: OutputDeviceIdentity?) -> String {
+        guard let identity else { return "<none>" }
+        return "deviceID:\(identity.deviceID),uid:\(identity.uid),format:\(identity.formatFingerprint)"
+    }
+
+    private static func lifecycleStateName(_ state: State) -> String {
+        switch state {
+        case .stopped: return "stopped"
+        case .starting: return "starting"
+        case .running: return "running"
+        case .recovering: return "recovering"
+        case .waitingForOutput: return "waitingForOutput"
+        case .connecting: return "connecting"
+        case .stopping: return "stopping"
+        case .recoveryFailed: return "recoveryFailed"
+        case .error: return "error"
+        }
     }
 
     private func beginOutputRecovery(route: AudioTapEngine, operation: Int, message: String) {
         guard generation == operation, isRunning else { return }
+        let revisionBefore = lifecycle.outputEventRevision
         _ = lifecycle.advanceOutputEventRevision()
         _ = lifecycle.requestOutputRecovery()
         recoveryFailureMessage = message
@@ -482,6 +571,7 @@ final class LevelUpModel: ObservableObject {
         _ = startupControl?.requestStop("menu-bar route health failure")
         lifecycle.beginCleanup(reason: .outputRecovery)
         state = .recovering
+        DiagnosticLog.write("recovery.route-trigger monotonicNs=\(DispatchTime.now().uptimeNanoseconds) generation=\(operation) attempt=\(lifecycle.recoveryAttempts) revisionBefore=\(revisionBefore) revisionAfter=\(lifecycle.outputEventRevision) reason=\(message)")
         performCleanup(route: route, operation: operation, reason: .outputRecovery)
     }
 
@@ -491,6 +581,7 @@ final class LevelUpModel: ObservableObject {
         state = .waitingForOutput
         let queryKey = "\(operation):\(revision)"
         guard recoveryQueriesInFlight.insert(queryKey).inserted else { return }
+        DiagnosticLog.write("recovery.snapshot.query.begin monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) settlingSnapshotRevision=\(revision) currentRevision=\(lifecycle.outputEventRevision)")
         audioQueue.async { [weak self] in
             let result: Result<OutputDeviceSnapshot, Error>
             do { result = .success(try resolveDefaultOutputSnapshot().snapshot) }
@@ -505,10 +596,19 @@ final class LevelUpModel: ObservableObject {
     private func handleRecoverySnapshot(_ result: Result<OutputDeviceSnapshot, Error>,
                                         operation: Int,
                                         revision: UInt64) {
+        let snapshotDescription: String
+        switch result {
+        case let .success(snapshot):
+            snapshotDescription = "identity={\(Self.outputIdentityDescription(snapshot.identity))},usable=\(snapshot.isUsable),validation=\(snapshot.unavailableReason ?? "valid"),listed=\(snapshot.isInDeviceList),alive=\(snapshot.isAlive),streams=\(snapshot.outputStreamCount),nominalRate=\(snapshot.nominalSampleRate),channels=\(snapshot.channelCount),floatPCM=\(snapshot.isFloatPCM),bits=\(snapshot.bitsPerChannel)"
+        case let .failure(error):
+            snapshotDescription = "queryFailure=\(error)"
+        }
+        DiagnosticLog.write("recovery.snapshot.result monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) settlingSnapshotRevision=\(revision) currentRevision=\(lifecycle.outputEventRevision) lifecycleGenerationCurrent=\(lifecycle.isCurrent(operation)) state=\(Self.lifecycleStateName(state)) result={\(snapshotDescription)}")
         guard recoveryIsActive, lifecycle.isCurrent(operation), lifecycle.intent == .running,
               !lifecycle.quitRequested, !cleanupPending else { return }
         guard revision == lifecycle.outputEventRevision else {
             outputStabilityGate.invalidate(revision: lifecycle.outputEventRevision)
+            DiagnosticLog.write("recovery.snapshot.stale monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) settlingSnapshotRevision=\(revision) currentRevision=\(lifecycle.outputEventRevision) action=resolve-latest")
             resolveOutputForRecovery(operation: operation, revision: lifecycle.outputEventRevision)
             return
         }
@@ -527,10 +627,13 @@ final class LevelUpModel: ObservableObject {
             guard snapshot.isUsable else {
                 recoveryFailureMessage = snapshot.unavailableReason ?? "The output is not ready."
                 outputStabilityGate.invalidate(revision: revision)
+                DiagnosticLog.write("recovery.snapshot.invalid monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) settlingSnapshotRevision=\(revision) identity={\(Self.outputIdentityDescription(snapshot.identity))} reason=\(snapshot.unavailableReason ?? "unknown")")
                 scheduleRecoveryResolution(operation: operation, revision: revision, after: outputSettleInterval)
                 return
             }
-            if outputStabilityGate.observe(snapshot, revision: revision) {
+            let isStable = outputStabilityGate.observe(snapshot, revision: revision)
+            DiagnosticLog.write("recovery.snapshot.settling monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) settlingSnapshotRevision=\(revision) identity={\(Self.outputIdentityDescription(snapshot.identity))} validation=valid stable=\(isStable) gateAcceptsRevision=\(outputStabilityGate.accepts(revision: revision))")
+            if isStable {
                 guard outputStabilityGate.accepts(revision: revision),
                       revision == lifecycle.outputEventRevision else { return }
                 recoverySnapshot = snapshot
@@ -560,11 +663,13 @@ final class LevelUpModel: ObservableObject {
             return
         }
         let delayIndex = min(lifecycle.recoveryAttempts, recoveryBackoff.count - 1)
+        let delay = recoveryBackoff[delayIndex]
         recoveryWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.beginRecoveryAttempt() }
         recoveryWorkItem = work
         state = .recovering
-        DispatchQueue.main.asyncAfter(deadline: .now() + recoveryBackoff[delayIndex], execute: work)
+        DiagnosticLog.write("recovery.attempt.scheduled monotonicNs=\(DispatchTime.now().uptimeNanoseconds) nextAttempt=\(lifecycle.recoveryAttempts + 1) afterSeconds=\(delay) generation=\(lifecycle.generation) outputEventRevision=\(lifecycle.outputEventRevision)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func failRecoveryAttempt(operation: Int, message: String) {
@@ -576,6 +681,7 @@ final class LevelUpModel: ObservableObject {
     }
 
     private func failRecovery(_ message: String) {
+        DiagnosticLog.write("recovery.exhausted monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempts=\(lifecycle.recoveryAttempts) generation=\(lifecycle.generation) outputEventRevision=\(lifecycle.outputEventRevision) reason=\(message)")
         recoveryWorkItem?.cancel()
         recoveryWorkItem = nil
         recoveryIsActive = false
@@ -584,10 +690,13 @@ final class LevelUpModel: ObservableObject {
     }
 
     func retryRecovery() {
+        let previousAttempts = lifecycle.recoveryAttempts
+        let revisionBefore = lifecycle.outputEventRevision
         guard lifecycle.requestManualRecovery() else { return }
         recoveryIsActive = true
         recoveryFailureMessage = "Waiting for a usable output."
         outputStabilityGate.invalidate(revision: lifecycle.outputEventRevision)
+        DiagnosticLog.write("recovery.manual-retry monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attemptsBeforeReset=\(previousAttempts) attemptsAfterReset=\(lifecycle.recoveryAttempts) generation=\(lifecycle.generation) revisionBefore=\(revisionBefore) revisionAfter=\(lifecycle.outputEventRevision)")
         scheduleNextRecoveryAttempt()
     }
 
@@ -600,7 +709,11 @@ final class LevelUpModel: ObservableObject {
         guard generation == operation else { return }
         startupTimedOut = false
         let wasRecoveryAttempt = isRecoveryStart
+        let cancellationReason = startupControl?.cancellationReason() ?? "<none>"
         isRecoveryStart = false
+        if wasRecoveryAttempt {
+            DiagnosticLog.write("recovery.startup.finish monotonicNs=\(DispatchTime.now().uptimeNanoseconds) attempt=\(lifecycle.recoveryAttempts) generation=\(operation) cancellationReason=\(cancellationReason) failure=\(failure ?? "<none>") pendingStop=\(pendingStop ?? "<none>") cleanupSucceeded=\(cleanupSucceeded) routeStopped=\(routeStopped) cleanupFailure=\(cleanupFailure ?? "<none>") outputEventRevision=\(lifecycle.outputEventRevision)")
+        }
         _ = lifecycle.startupFailed(generation: operation, cleanupSucceeded: cleanupSucceeded)
         if routeStopped {
             activeDeviceListenerToken = nil
