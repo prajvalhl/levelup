@@ -2,14 +2,14 @@
 
 LevelUp is a native macOS menu-bar app that routes system audio through a real-time compressor and peak limiter before sending it to the Mac's current physical output. It is designed to make quiet content easier to hear while reducing the level difference between quieter and louder passages.
 
-This is an early release for **Apple Silicon (ARM64)** Macs running **macOS 14.4 or later**. The current release candidate is **0.2.0**. It uses Apple's built-in Core Audio APIs and does not install a virtual audio driver.
+This is an early release for **Apple Silicon (ARM64)** Macs running **macOS 14.4 or later**. The current release candidate is **0.2.1**. It uses Apple's built-in Core Audio APIs and does not install a virtual audio driver.
 
 ## What LevelUp does
 
 - Captures system audio locally with a Core Audio process tap.
 - Passes audio through unchanged in Bypass, or processes it with the Gentle, Balanced, Strong, or Custom compressor/limiter settings.
 - Follows the current macOS default output. When that output changes or disconnects, LevelUp safely cleans up the old route and attempts to build a fresh route for the new default.
-- Provides a menu-bar popover for starting, stopping, selecting a mode, and editing supported Custom parameters.
+- Uses a custom icon-only menu-bar control that adapts to light and dark appearances, with a popover for starting, stopping, selecting a mode, and editing supported Custom parameters.
 - Restores normal playback by stopping the route and releasing its Core Audio resources.
 
 LevelUp does not record or save audio, send audio over a network, install drivers or background services, or change the system's default output device. The system-audio capture permission is required because the process tap reads system audio; permission does not mean audio is stored or transmitted.
@@ -18,11 +18,11 @@ LevelUp does not record or save audio, send audio over a network, install driver
 
 ### Install from the DMG
 
-1. Download the versioned `LevelUp-vX.Y.Z.dmg` asset from a GitHub Release and open it (for this release, `LevelUp-v0.2.0.dmg`).
+1. Download the versioned `LevelUp-vX.Y.Z.dmg` asset from a GitHub Release and open it (for this release, `LevelUp-v0.2.1.dmg`).
 2. Drag `LevelUp.app` to the `Applications` shortcut in the mounted image, then eject the image.
 3. Open LevelUp from Applications. Because this free build is ad-hoc signed and not notarized, macOS may show an unidentified-developer or “Apple cannot check” warning. After the first blocked launch, open **System Settings → Privacy & Security**, find the LevelUp notice, choose **Open Anyway**, and confirm the next prompt. Only do this if you trust the source you downloaded. Do not disable Gatekeeper globally. See Apple's [per-app approval instructions](https://support.apple.com/guide/mac-help/mh40617/27/mac/27).
 4. Start playing audio in another app before starting LevelUp. When macOS asks, grant system-audio capture permission. It appears in **System Settings → Privacy & Security → Screen & System Audio Recording** on recent macOS versions; wording can vary on older supported releases. If LevelUp is not listed, use the add control to select it. See Apple's [permission instructions](https://support.apple.com/guide/mac-help/control-access-screen-system-audio-recording-mchld6aa7d23/mac).
-5. Click the LevelUp waveform in the menu bar and choose **Start LevelUp**. The app asks for confirmation because its tap temporarily mutes original application playback while routing it through LevelUp.
+5. Click the LevelUp icon in the menu bar and choose **Start LevelUp**. The app asks for confirmation because its tap temporarily mutes original application playback while routing it through LevelUp.
 
 The system-audio permission is per user/Mac. Each person installing the app must approve it on their own Mac. If permission is denied or not yet granted, the app may not receive audio; silent buffers alone do not establish the permission state.
 
@@ -72,9 +72,10 @@ The interface runs on the main actor. Startup, stop, cleanup, and synchronous ou
 | `Sources/PrototypeSupport/` | Argument parsing and testable startup, cleanup, and session state helpers |
 | `Tests/SystemAudioPassThroughTests/` | DSP, cleanup lifecycle, callback metrics, startup, argument, and session-state tests |
 | `Assets/LevelUp-Icon-Source.png` | Supplied Liquid Glass app icon artwork |
+| `Assets/LevelUpMenuBarIcon.png` | Cropped template image used for the icon-only menu-bar control |
 | `scripts/build-icon.sh` | Generates and validates the multi-resolution `.icns` app icon |
 | `scripts/build-app.sh` | Builds the ARM64 app bundle, embeds its icon, and ad-hoc signs it |
-| `scripts/release-dmg.sh` | Runs tests, verifies the bundle, and creates a versioned DMG such as `release/LevelUp-v0.2.0.dmg` |
+| `scripts/release-dmg.sh` | Runs tests, verifies the bundle, and creates a versioned DMG such as `release/LevelUp-v0.2.1.dmg` |
 
 The implementation uses Swift, SwiftUI, AppKit, Core Audio, Accelerate/vDSP, and a small C metrics helper. It has no third-party package dependencies.
 
@@ -101,7 +102,7 @@ Build the free distributable image (runs tests and bundle/signature checks as pa
 scripts/release-dmg.sh
 ```
 
-The output is `release/LevelUp-v0.2.0.dmg`; the release script derives the name from the app version and refuses to overwrite an existing artifact. `.build/` and `release/` are ignored by Git. The app uses an **ad-hoc signature only**. This is not Developer ID signing or notarization, and no paid signing service is used. The build scripts do not disable Gatekeeper, change system audio settings, or publish/upload anything.
+The output is `release/LevelUp-v0.2.1.dmg`; the release script derives the name from the app version and refuses to overwrite an existing artifact. `.build/` and `release/` are ignored by Git. The app uses an **ad-hoc signature only**. This is not Developer ID signing or notarization, and no paid signing service is used. The build scripts do not disable Gatekeeper, change system audio settings, or publish/upload anything.
 
 ## CLI diagnostics
 

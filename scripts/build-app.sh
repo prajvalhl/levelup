@@ -9,12 +9,14 @@ swift build -c release --triple "$TRIPLE"
 BIN_DIR="$(swift build -c release --triple "$TRIPLE" --show-bin-path)"
 APP="$ROOT/.build/LevelUp.app"
 ICON="$ROOT/.build/generated-icon/LevelUp.icns"
+MENU_BAR_ICON="$ROOT/Assets/LevelUpMenuBarIcon.png"
 "$ROOT/scripts/build-icon.sh"
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/SystemAudioPassThrough" "$APP/Contents/MacOS/SystemAudioPassThrough"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ICON" "$APP/Contents/Resources/LevelUp.icns"
+cp "$MENU_BAR_ICON" "$APP/Contents/Resources/LevelUpMenuBarIcon.png"
 codesign --force --sign - "$APP"
 
 ARCHS="$(lipo -archs "$APP/Contents/MacOS/SystemAudioPassThrough")"
@@ -30,6 +32,10 @@ if [[ ! -s "$APP/Contents/Resources/LevelUp.icns" ]]; then
     echo "error: app icon resource is missing or empty" >&2
     exit 1
 fi
+if [[ ! -s "$APP/Contents/Resources/LevelUpMenuBarIcon.png" ]]; then
+    echo "error: menu-bar icon resource is missing or empty" >&2
+    exit 1
+fi
 plutil -lint "$APP/Contents/Info.plist"
 codesign --verify --deep --strict "$APP"
-echo "Built and verified $APP ($ARCHS; icon=LevelUp.icns)"
+echo "Built and verified $APP ($ARCHS; icon=LevelUp.icns; menu-bar icon=LevelUpMenuBarIcon.png)"
