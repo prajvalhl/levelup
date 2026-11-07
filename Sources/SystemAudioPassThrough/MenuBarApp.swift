@@ -1383,25 +1383,37 @@ private extension LevelUpModel {
 }
 
 @MainActor
-final class LevelUpAppDelegate: NSObject, NSApplicationDelegate {
+final class LevelUpAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let model = LevelUpModel()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
+    private var menuBarClickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DiagnosticLog.configure(requestedPath: "/private/tmp/levelup-menu-bar-\(getpid()).log")
         DiagnosticLog.write("menu-bar application launched: pid=\(getpid()); bundleID=\(Bundle.main.bundleIdentifier ?? "<missing>"); capture remains local-only")
         NSApp.setActivationPolicy(.accessory)
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "LevelUp audio control")
-            button.title = " LevelUp"
+            if let iconURL = Bundle.main.url(forResource: "LevelUpMenuBarIcon", withExtension: "png"),
+               let icon = NSImage(contentsOf: iconURL) {
+                let naturalSize = icon.size
+                if naturalSize.width > 0, naturalSize.height > 0 {
+                    let scale = min(20 / naturalSize.width, 18 / naturalSize.height)
+                    icon.size = NSSize(width: naturalSize.width * scale,
+                                       height: naturalSize.height * scale)
+                }
+                icon.isTemplate = true
+                button.image = icon
+            }
+            button.imagePosition = .imageOnly
             button.target = self
             button.action = #selector(togglePopover(_:))
             button.setAccessibilityLabel("LevelUp audio control")
         }
         statusItem = item
+        popover.delegate = self
         popover.behavior = .transient
         popover.animates = true
         popover.contentViewController = NSHostingController(rootView: LevelUpPopover(model: model))
@@ -1414,7 +1426,53 @@ final class LevelUpAppDelegate: NSObject, NSApplicationDelegate {
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            installMenuBarClickMonitor()
         }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeMenuBarClickMonitor()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        removeMenuBarClickMonitor()
+    }
+
+    private func installMenuBarClickMonitor() {
+        guard menuBarClickMonitor == nil else { return }
+        menuBarClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.popover.isShown else { return }
+                let point = NSEvent.mouseLocation
+                guard self.isInMenuBar(at: point),
+                      let statusItemFrame = self.statusItemScreenFrame,
+                      !statusItemFrame.contains(point) else { return }
+                self.popover.performClose(nil)
+            }
+        }
+    }
+
+    private func removeMenuBarClickMonitor() {
+        guard let menuBarClickMonitor else { return }
+        NSEvent.removeMonitor(menuBarClickMonitor)
+        self.menuBarClickMonitor = nil
+    }
+
+    private var statusItemScreenFrame: NSRect? {
+        guard let button = statusItem?.button,
+              let window = button.window else { return nil }
+        return window.convertToScreen(button.convert(button.bounds, to: nil))
+    }
+
+    private func isInMenuBar(at point: NSPoint) -> Bool {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) else { return false }
+        let height = screen.frame.maxY - screen.visibleFrame.maxY
+        guard height > 0 else { return false }
+        let menuBarFrame = NSRect(x: screen.frame.minX,
+                                  y: screen.visibleFrame.maxY,
+                                  width: screen.frame.width,
+                                  height: height)
+        return menuBarFrame.contains(point)
     }
 }
 

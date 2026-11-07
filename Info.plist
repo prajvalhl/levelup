@@ -8,8 +8,8 @@
     <key>CFBundleDisplayName</key><string>LevelUp</string>
     <key>CFBundleIconFile</key><string>LevelUp.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>2</string>
-    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>0.2.1</string>
     <key>LSUIElement</key><true/>
     <key>LSMinimumSystemVersion</key><string>14.4</string>
     <key>NSAudioCaptureUsageDescription</key><string>LevelUp routes audio through local compression and limiting on this Mac. Audio is not recorded, saved, or transmitted.</string>
