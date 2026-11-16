@@ -1,6 +1,6 @@
-# LevelUp v0.2.2 — Upcoming (Unreleased)
+# LevelUp v0.2.2
 
-**Status:** Prepared and verified locally, but not published. The local artifact is `release/LevelUp-v0.2.2.dmg`; no public v0.2.2 download is available yet.
+**Status:** Published as a stable release on [GitHub](https://github.com/prajvalhl/levelup/releases/tag/v0.2.2). Download [LevelUp-v0.2.2.dmg](https://github.com/prajvalhl/levelup/releases/download/v0.2.2/LevelUp-v0.2.2.dmg) (build 4).
 
 This release adds automatic recovery from macOS sleep and wake, improves callback startup and stall detection, and brings the LevelUp logo into the popover header. The existing icon-only menu-bar branding was introduced in v0.2.1 and is not new in this release.
 
@@ -34,7 +34,6 @@ See [README.md](README.md) for installation, privacy, architecture, and troubles
 - Bluetooth reconnection timing varies, and audio-device or driver behavior is not guaranteed across every hardware configuration.
 - A no-callback startup condition occurred once in earlier lifecycle testing even though `AudioDeviceStart` returned success. Later lifecycle tests passed, but the original condition has not been conclusively proven impossible. The watchdog has automated coverage for bounded recovery; its timeout failure paths were not deliberately triggered on hardware.
 - The limiter is sample-peak based, has no lookahead, and does not guarantee true-peak limiting.
-- The v0.2.2 DMG has not been attached to a public GitHub release. No public download link is available yet.
 
 ## Transparency
 
