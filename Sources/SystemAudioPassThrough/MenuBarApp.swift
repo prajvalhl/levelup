@@ -1310,6 +1310,19 @@ final class LevelUpModel: ObservableObject {
 struct LevelUpPopover: View {
     @ObservedObject var model: LevelUpModel
 
+    private static let popoverLogoImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "LevelUpMenuBarIcon", withExtension: "png") else {
+            DiagnosticLog.write("popover logo unavailable: LevelUpMenuBarIcon.png is missing from app bundle resources; using waveform fallback")
+            return nil
+        }
+        guard let image = NSImage(contentsOf: url) else {
+            DiagnosticLog.write("popover logo unavailable: bundled LevelUpMenuBarIcon.png could not be decoded; using waveform fallback")
+            return nil
+        }
+        image.isTemplate = true
+        return image
+    }()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
@@ -1353,11 +1366,22 @@ struct LevelUpPopover: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: "waveform")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 38, height: 38)
-                .background(LinearGradient(colors: [.indigo, .blue], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 11))
+            Group {
+                if let logo = Self.popoverLogoImage {
+                    Image(nsImage: logo)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 25, height: 22)
+                        .foregroundStyle(.white)
+                } else {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(width: 38, height: 38)
+            .background(LinearGradient(colors: [.indigo, .blue], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 11))
             VStack(alignment: .leading, spacing: 3) {
                 Text("LevelUp").font(.system(size: 16, weight: .semibold))
                 HStack(spacing: 5) {
