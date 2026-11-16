@@ -75,8 +75,10 @@ final class LevelUpModel: ObservableObject {
     private var recoveryWorkItem: DispatchWorkItem?
     private var recoveryIsActive = false
     private var cleanupInFlight = false
+    private var startupInFlight = false
     private var outputStabilityGate = OutputDeviceStabilityGate()
     private var routeHealthGate = RouteHealthGate(requiredProgressSamples: 2)
+    private var callbackWatchdog = RouteCallbackWatchdog()
     private var recoverySettleStartNanoseconds: UInt64 = 0
     private var recoverySnapshot: OutputDeviceSnapshot?
     private var recoveryAttemptGeneration: Int?
@@ -86,10 +88,8 @@ final class LevelUpModel: ObservableObject {
     private let recoveryBackoff: [TimeInterval] = [0.5, 1.0, 2.0, 4.0]
     private let outputSettleInterval: TimeInterval = 0.4
     private let outputSettleBudget: TimeInterval = 4.0
-    private var routeMonitorStartNanoseconds: UInt64 = 0
-    private var lastCallbackProgressNanoseconds: UInt64 = 0
-    private var lastObservedCallbackCount: UInt64 = 0
     private var routeFailureAfterStop: String?
+    private var sleepInvalidatedStartupOperation: Int?
 
     var isBusy: Bool {
         if cleanupInFlight { return true }
@@ -227,6 +227,105 @@ final class LevelUpModel: ObservableObject {
         showStartConfirmation = false
     }
 
+    /// NSWorkspace's will-sleep notification is a best-effort opportunity to
+    /// stop the route. The system may suspend the process before async Core
+    /// Audio cleanup finishes; wake handling retries cleanup before recovery.
+    func systemWillSleep() {
+        let generationBeforeSleep = generation
+        guard lifecycle.sleepBegan() else {
+            DiagnosticLog.write("power.sleep.duplicate monotonicNs=\(DispatchTime.now().uptimeNanoseconds) generation=\(generation) intent=\(lifecycle.intent) action=ignored")
+            return
+        }
+
+        recoveryWorkItem?.cancel()
+        recoveryWorkItem = nil
+        recoveryAttemptGeneration = nil
+        recoveryQueriesInFlight.removeAll()
+        recoveryIsActive = lifecycle.intent == .running
+        activeDeviceListenerToken = nil
+        let revision = lifecycle.advanceOutputEventRevision()
+        outputStabilityGate.invalidate(revision: revision)
+        stopRouteMonitor()
+
+        DiagnosticLog.write("power.sleep.begin monotonicNs=\(DispatchTime.now().uptimeNanoseconds) generationBefore=\(generationBeforeSleep) generationAfter=\(generation) intent=\(lifecycle.intent) phase=\(lifecycle.phase) outputEventRevision=\(revision) cleanupInFlight=\(cleanupInFlight) cleanupPending=\(cleanupPending) routePresent=\(engine != nil) cleanupBeforePhysicalSleepGuaranteed=false")
+
+        let startupIsInFlight: Bool
+        switch state {
+        case .starting, .connecting: startupIsInFlight = true
+        default: startupIsInFlight = self.startupInFlight
+        }
+        if startupIsInFlight {
+            sleepInvalidatedStartupOperation = generationBeforeSleep
+            cleanupInFlight = true
+            _ = startupControl?.requestStop("system sleep began")
+            state = .stopping
+            return
+        }
+
+        if cleanupInFlight {
+            // The current serialized cleanup owns this route. Its completion
+            // is accepted by route identity, not the invalidated generation.
+            state = lifecycle.intent == .running ? .recovering : .stopping
+            return
+        }
+
+        guard let route = engine else {
+            state = lifecycle.intent == .running ? .recovering : .stopped
+            return
+        }
+
+        let reason = cleanupReasonForCurrentIntent(default: .systemSleep)
+        lifecycle.beginCleanup(reason: reason)
+        _ = startupControl?.requestStop("system sleep began")
+        state = .stopping
+        performCleanup(route: route, operation: generation, reason: reason)
+    }
+
+    /// Wake always requests a fresh output snapshot and route when running was
+    /// intended, even if no Core Audio device-change notification was emitted.
+    func systemDidWake() {
+        guard lifecycle.wakeCompleted() else {
+            DiagnosticLog.write("power.wake.duplicate monotonicNs=\(DispatchTime.now().uptimeNanoseconds) generation=\(generation) intent=\(lifecycle.intent) action=ignored")
+            return
+        }
+
+        outputStabilityGate.invalidate(revision: lifecycle.outputEventRevision)
+        recoveryIsActive = lifecycle.intent == .running
+        DiagnosticLog.write("power.wake.complete monotonicNs=\(DispatchTime.now().uptimeNanoseconds) generation=\(generation) intent=\(lifecycle.intent) phase=\(lifecycle.phase) outputEventRevision=\(lifecycle.outputEventRevision) cleanupInFlight=\(cleanupInFlight) cleanupPending=\(cleanupPending)")
+
+        guard lifecycle.intent == .running else {
+            if lifecycle.quitRequested {
+                quit()
+            } else if cleanupPending, !cleanupInFlight {
+                retryCleanup()
+            } else {
+                state = .stopped
+            }
+            return
+        }
+
+        if cleanupInFlight { state = .recovering; return }
+        if cleanupPending {
+            retryCleanup()
+            return
+        }
+        if let route = engine {
+            beginOutputRecovery(route: route,
+                               operation: generation,
+                               message: "Audio routing is being rebuilt after system wake.")
+        } else {
+            state = .recovering
+            recoveryFailureMessage = "Waiting for a usable output after system wake."
+            scheduleNextRecoveryAttempt()
+        }
+    }
+
+    private func cleanupReasonForCurrentIntent(default defaultReason: SessionLifecycleReducer.CleanupReason) -> SessionLifecycleReducer.CleanupReason {
+        if lifecycle.quitRequested { return .quit }
+        if lifecycle.intent == .stopped { return .userStop }
+        return defaultReason
+    }
+
     private func beginStart() {
         guard let operation = lifecycle.beginStart() else { return }
         startEngine(operation: operation, expectedOutput: nil, recovery: false)
@@ -259,6 +358,7 @@ final class LevelUpModel: ObservableObject {
                                    expectedOutputIdentity: expectedOutput?.identity,
                                    startupCancellationReason: { control.cancellationReason() })
         startupControl = control
+        startupInFlight = true
         engine = route
         activeMode = nil
         startupTimedOut = false
@@ -314,6 +414,7 @@ final class LevelUpModel: ObservableObject {
                                                    listeners.removeActiveDeviceListener()
                                                }) { [weak self] cleanup in
                     self?.finishStart(operation: operation,
+                                      route: route,
                                       failure: failure,
                                       pendingStop: pendingStop,
                                       cleanupSucceeded: cleanup.isComplete,
@@ -329,7 +430,20 @@ final class LevelUpModel: ObservableObject {
     }
 
     private func finishSuccessfulStart(operation: Int, mode: DSPMode, route: AudioTapEngine) {
-        guard generation == operation else { return }
+        guard generation == operation else {
+            guard sleepInvalidatedStartupOperation == operation, engine === route else { return }
+            sleepInvalidatedStartupOperation = nil
+            startupInFlight = false
+            cleanupInFlight = false
+            _ = startupControl?.requestStop("system sleep invalidated startup")
+            let reason = cleanupReasonForCurrentIntent(default: .systemSleep)
+            lifecycle.beginCleanup(reason: reason)
+            state = .stopping
+            DiagnosticLog.write("power.sleep.startup-unwind monotonicNs=\(DispatchTime.now().uptimeNanoseconds) startupGeneration=\(operation) currentGeneration=\(generation) cleanupReason=\(reason)")
+            performCleanup(route: route, operation: generation, reason: reason)
+            return
+        }
+        startupInFlight = false
         guard lifecycle.startupSucceeded(generation: operation) else {
             // Stop or Quit can arrive after Core Audio startup returns but
             // before this main-queue transition. The route is already live,
@@ -348,39 +462,110 @@ final class LevelUpModel: ObservableObject {
         startRouteMonitor(route: route, operation: operation)
     }
 
+    private func finishSleepInvalidatedStartup(route: AudioTapEngine,
+                                               operation: Int,
+                                               failure: String?,
+                                               cleanupSucceeded: Bool,
+                                               cleanupFailure: String?) {
+        sleepInvalidatedStartupOperation = nil
+        startupInFlight = false
+        cleanupInFlight = false
+        startupTimedOut = false
+        isRecoveryStart = false
+        activeDeviceListenerToken = nil
+        let reason = cleanupReasonForCurrentIntent(default: .systemSleep)
+        let failureDescription = failure ?? "none"
+        let cleanupFailureDescription = cleanupFailure ?? "none"
+        DiagnosticLog.write("power.sleep.startup-cleanup monotonicNs=\(DispatchTime.now().uptimeNanoseconds) startupGeneration=\(operation) currentGeneration=\(generation) failure=\(failureDescription) cleanupSucceeded=\(cleanupSucceeded) cleanupFailure=\(cleanupFailureDescription) reason=\(reason) sleeping=\(lifecycle.isSleeping)")
+
+        guard cleanupSucceeded else {
+            lifecycle.cleanupFailed(reason: reason)
+            state = .error(cleanupIncompleteMessage(cleanupFailure))
+            return
+        }
+
+        switch lifecycle.cleanupSucceeded(reason: reason) {
+        case .quit:
+            engine = nil
+            startupControl = nil
+            activeMode = nil
+            cleanupSessionListenersAfterRouteStop(route: route,
+                                                  epoch: listenerSessionEpoch,
+                                                  reason: .quit) {
+                NSApp.terminate(nil)
+            }
+        case .stopped:
+            engine = nil
+            startupControl = nil
+            activeMode = nil
+            cleanupSessionListenersAfterRouteStop(route: route,
+                                                  epoch: listenerSessionEpoch,
+                                                  reason: .userStop) {
+                self.state = .stopped
+            }
+        case .sleeping:
+            engine = nil
+            startupControl = nil
+            activeMode = nil
+            state = .recovering
+        case .recover:
+            engine = nil
+            startupControl = nil
+            activeMode = nil
+            recoveryIsActive = true
+            state = .recovering
+            scheduleNextRecoveryAttempt()
+        case .restart:
+            engine = nil
+            startupControl = nil
+            activeMode = nil
+            state = .recovering
+            scheduleNextRecoveryAttempt()
+        }
+    }
+
     private func startRouteMonitor(route: AudioTapEngine, operation: Int) {
         stopRouteMonitor()
         let now = DispatchTime.now().uptimeNanoseconds
-        routeMonitorStartNanoseconds = now
-        lastCallbackProgressNanoseconds = now
-        lastObservedCallbackCount = route.callbackCount
-        callbackCount = lastObservedCallbackCount
+        callbackCount = route.callbackCount
         routeHasCallbacks = callbackCount > 0
         routeHealthGate.reset()
+        callbackWatchdog.start(generation: operation,
+                               nowNanoseconds: now,
+                               callbackCount: callbackCount)
 
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self, weak route] in
-            guard let self, let route, self.generation == operation, self.isRunning else { return }
+            guard let self, let route, self.generation == operation,
+                  self.engine === route, self.isRunning else { return }
             let callbacks = route.callbackCount
             self.callbackCount = callbacks
             let now = DispatchTime.now().uptimeNanoseconds
-            if callbacks != self.lastObservedCallbackCount {
-                self.lastObservedCallbackCount = callbacks
-                self.lastCallbackProgressNanoseconds = now
-            }
             if callbacks > 0 { self.routeHasCallbacks = true }
 
-            let failure: String?
-            if callbacks == 0 && Self.elapsedMilliseconds(since: self.routeMonitorStartNanoseconds, now: now) >= 5_000 {
-                failure = "No audio callbacks arrived within five seconds. The route may still be waiting for tap audio; output recovery is being attempted safely."
-            } else if callbacks > 0 && Self.elapsedMilliseconds(since: self.lastCallbackProgressNanoseconds, now: now) >= 5_000 {
-                failure = "Audio callbacks stopped progressing for five seconds. Output recovery is being attempted safely."
-            } else {
-                failure = nil
-            }
-            if let failure {
-                self.beginOutputRecovery(route: route, operation: operation, message: failure)
+            let observation = self.callbackWatchdog.observe(generation: operation,
+                                                            callbackCount: callbacks,
+                                                            nowNanoseconds: now)
+            if case let .failed(failure) = observation {
+                // A callback racing the timer gets one final chance to advance.
+                // Confirm the route and generation before committing recovery.
+                guard self.generation == operation, self.engine === route,
+                      self.isRunning, !self.cleanupInFlight, !self.cleanupPending else { return }
+                let rechecked = self.callbackWatchdog.observe(
+                    generation: operation,
+                    callbackCount: route.callbackCount,
+                    nowNanoseconds: DispatchTime.now().uptimeNanoseconds
+                )
+                guard rechecked == .failed(failure) else { return }
+                let message: String
+                switch failure {
+                case .callbackAcquisitionTimedOut:
+                    message = "No audio callbacks arrived within eight seconds. Output recovery is being attempted safely."
+                case .callbackProgressStalled:
+                    message = "Audio callbacks stopped progressing for five seconds. Output recovery is being attempted safely."
+                }
+                self.beginOutputRecovery(route: route, operation: operation, message: message)
                 return
             }
             self.reconcileOutput(route: route, operation: operation)
@@ -397,6 +582,7 @@ final class LevelUpModel: ObservableObject {
         routeMonitor?.setEventHandler {}
         routeMonitor?.cancel()
         routeMonitor = nil
+        callbackWatchdog.cancel()
     }
 
     /// Reconciliation queries run on the serialized control queue. Notifications
@@ -567,7 +753,9 @@ final class LevelUpModel: ObservableObject {
     }
 
     private func beginOutputRecovery(route: AudioTapEngine, operation: Int, message: String) {
-        guard generation == operation, isRunning else { return }
+        guard generation == operation, isRunning, engine === route,
+              !cleanupInFlight, !cleanupPending, !lifecycle.isSleeping,
+              lifecycle.intent == .running, !lifecycle.quitRequested else { return }
         let revisionBefore = lifecycle.outputEventRevision
         _ = lifecycle.advanceOutputEventRevision()
         _ = lifecycle.requestOutputRecovery()
@@ -708,12 +896,22 @@ final class LevelUpModel: ObservableObject {
     }
 
     private func finishStart(operation: Int,
+                             route: AudioTapEngine,
                              failure: String?,
                              pendingStop: String?,
                              cleanupSucceeded: Bool,
                              routeStopped: Bool,
                              cleanupFailure: String?) {
+        if sleepInvalidatedStartupOperation == operation, engine === route {
+            finishSleepInvalidatedStartup(route: route,
+                                          operation: operation,
+                                          failure: failure,
+                                          cleanupSucceeded: cleanupSucceeded,
+                                          cleanupFailure: cleanupFailure)
+            return
+        }
         guard generation == operation else { return }
+        startupInFlight = false
         startupTimedOut = false
         let wasRecoveryAttempt = isRecoveryStart
         let cancellationReason = startupControl?.cancellationReason() ?? "<none>"
@@ -1000,8 +1198,9 @@ final class LevelUpModel: ObservableObject {
             let success = routeStopped && listenerFailure == nil
             let cleanupFailure = routeStopped ? listenerFailure : route.lastCleanupFailure
             DispatchQueue.main.async {
-                guard let self, self.generation == operation else { return }
+                guard let self, self.engine === route, self.cleanupInFlight else { return }
                 self.cleanupInFlight = false
+                DiagnosticLog.write("cleanup.completion monotonicNs=\(DispatchTime.now().uptimeNanoseconds) operationGeneration=\(operation) currentGeneration=\(self.generation) reason=\(reason) routeStopped=\(routeStopped) listenerRemovalSucceeded=\(listenerFailure == nil) cleanupSucceeded=\(success) sleeping=\(self.lifecycle.isSleeping)")
                 if routeStopped { self.activeDeviceListenerToken = nil }
                 if success {
                     switch self.lifecycle.cleanupSucceeded(reason: reason) {
@@ -1023,6 +1222,12 @@ final class LevelUpModel: ObservableObject {
                         self.activeDeviceListenerToken = nil
                         self.recoveryIsActive = true
                         self.scheduleNextRecoveryAttempt()
+                    case .sleeping:
+                        self.engine = nil
+                        self.startupControl = nil
+                        self.activeMode = nil
+                        self.recoveryIsActive = self.lifecycle.intent == .running
+                        self.state = self.lifecycle.intent == .running ? .recovering : .stopped
                     case .stopped:
                         self.activeDeviceListenerToken = nil
                         self.cleanupSessionListenersAfterRouteStop(route: route,
@@ -1105,6 +1310,19 @@ final class LevelUpModel: ObservableObject {
 struct LevelUpPopover: View {
     @ObservedObject var model: LevelUpModel
 
+    private static let popoverLogoImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "LevelUpMenuBarIcon", withExtension: "png") else {
+            DiagnosticLog.write("popover logo unavailable: LevelUpMenuBarIcon.png is missing from app bundle resources; using waveform fallback")
+            return nil
+        }
+        guard let image = NSImage(contentsOf: url) else {
+            DiagnosticLog.write("popover logo unavailable: bundled LevelUpMenuBarIcon.png could not be decoded; using waveform fallback")
+            return nil
+        }
+        image.isTemplate = true
+        return image
+    }()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
@@ -1148,11 +1366,22 @@ struct LevelUpPopover: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: "waveform")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 38, height: 38)
-                .background(LinearGradient(colors: [.indigo, .blue], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 11))
+            Group {
+                if let logo = Self.popoverLogoImage {
+                    Image(nsImage: logo)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 25, height: 22)
+                        .foregroundStyle(.white)
+                } else {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(width: 38, height: 38)
+            .background(LinearGradient(colors: [.indigo, .blue], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 11))
             VStack(alignment: .leading, spacing: 3) {
                 Text("LevelUp").font(.system(size: 16, weight: .semibold))
                 HStack(spacing: 5) {
@@ -1388,11 +1617,13 @@ final class LevelUpAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
     private var menuBarClickMonitor: Any?
+    private var powerObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DiagnosticLog.configure(requestedPath: "/private/tmp/levelup-menu-bar-\(getpid()).log")
         DiagnosticLog.write("menu-bar application launched: pid=\(getpid()); bundleID=\(Bundle.main.bundleIdentifier ?? "<missing>"); capture remains local-only")
         NSApp.setActivationPolicy(.accessory)
+        installPowerObservers()
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
@@ -1436,6 +1667,31 @@ final class LevelUpAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
 
     func applicationWillTerminate(_ notification: Notification) {
         removeMenuBarClickMonitor()
+        removePowerObservers()
+    }
+
+    private func installPowerObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        powerObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification,
+                                                  object: nil,
+                                                  queue: .main) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.model.systemWillSleep() }
+        })
+        powerObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                  object: nil,
+                                                  queue: .main) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.model.systemDidWake() }
+        })
+    }
+
+    private func removePowerObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        for observer in powerObservers {
+            center.removeObserver(observer)
+        }
+        powerObservers.removeAll()
     }
 
     private func installMenuBarClickMonitor() {

@@ -41,20 +41,161 @@ final class SessionLifecycleReducerTests: XCTestCase {
     func testSleepDuringStartupSuppressesCompletionAndRecovery() {
         var reducer = SessionLifecycleReducer()
         let startingGeneration = try! XCTUnwrap(reducer.beginStart())
-        reducer.sleepBegan()
+        XCTAssertTrue(reducer.sleepBegan())
         XCTAssertFalse(reducer.startupSucceeded(generation: startingGeneration))
         XCTAssertEqual(reducer.intent, .running)
         XCTAssertEqual(reducer.phase, .sleeping)
         XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertTrue(reducer.outputChangePending)
+        XCTAssertNotNil(reducer.beginRecoveryAttempt(), "Wake must initiate recovery even without a device notification")
     }
 
-    func testOutputChangeWhileSleepingIsRememberedForWake() {
+    func testSleepWhileRunningStopsRouteAndWakeRecoversWithoutOutputChange() {
         var reducer = runningReducer()
-        reducer.sleepBegan()
-        XCTAssertTrue(reducer.recordOutputChange(generation: reducer.generation))
+        XCTAssertTrue(reducer.sleepBegan())
+        XCTAssertEqual(reducer.intent, .running)
+        XCTAssertTrue(reducer.outputChangePending)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .sleeping)
         XCTAssertEqual(reducer.phase, .sleeping)
-        reducer.wakeCompleted()
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertNotNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testChangedOutputWhileSleepingCoalescesWithWakeRecovery() {
+        var reducer = runningReducer()
+        XCTAssertTrue(reducer.sleepBegan())
+        let revisionBeforeOutputEvent = reducer.outputEventRevision
+        XCTAssertFalse(reducer.recordOutputChange(generation: reducer.generation), "Sleep already requested a coalesced recovery")
+        XCTAssertEqual(reducer.outputEventRevision, revisionBeforeOutputEvent &+ 1)
+        XCTAssertEqual(reducer.phase, .sleeping)
+        XCTAssertTrue(reducer.wakeCompleted())
         XCTAssertEqual(reducer.phase, .recovering)
+        XCTAssertNotNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testStopDuringSleepPreventsWakeRecovery() {
+        var reducer = runningReducer()
+        XCTAssertTrue(reducer.sleepBegan())
+        reducer.requestStop()
+        XCTAssertFalse(reducer.outputChangePending)
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertEqual(reducer.intent, .stopped)
+        XCTAssertEqual(reducer.phase, .stopped)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testQuitDuringSleepCleanupTakesPrecedenceAndNeverRestarts() {
+        var reducer = runningReducer()
+        XCTAssertTrue(reducer.sleepBegan())
+        reducer.beginCleanup(reason: .systemSleep)
+        reducer.requestQuit()
+        reducer.cleanupFailed(reason: .systemSleep)
+        XCTAssertTrue(reducer.cleanupPending)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .quit)
+        XCTAssertNil(reducer.beginStart())
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testWakeKeepsRecoveryBlockedUntilSleepCleanupSucceeds() {
+        var reducer = runningReducer()
+        XCTAssertTrue(reducer.sleepBegan())
+        reducer.beginCleanup(reason: .systemSleep)
+        reducer.cleanupFailed(reason: .systemSleep)
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertTrue(reducer.cleanupPending)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .recover)
+        XCTAssertNotNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testCleanupStartedBeforeSleepCompletesAfterWakeAndThenAllowsRecovery() {
+        var reducer = runningReducer()
+        reducer.beginCleanup(reason: .outputRecovery)
+        let cleanupGeneration = reducer.generation
+
+        XCTAssertTrue(reducer.sleepBegan())
+        XCTAssertFalse(reducer.isCurrent(cleanupGeneration))
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .outputRecovery), .recover)
+        XCTAssertNotNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testStopDuringSleepCleanupPreventsRecoveryAfterCleanupCompletes() {
+        var reducer = runningReducer()
+        XCTAssertTrue(reducer.sleepBegan())
+        reducer.beginCleanup(reason: .systemSleep)
+        reducer.requestStop()
+        XCTAssertTrue(reducer.wakeCompleted())
+
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .stopped)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertEqual(reducer.intent, .stopped)
+    }
+
+    func testQuitDuringSleepCleanupRemainsHighestPriorityAfterWake() {
+        var reducer = runningReducer()
+        XCTAssertTrue(reducer.sleepBegan())
+        reducer.beginCleanup(reason: .systemSleep)
+        reducer.requestQuit()
+        XCTAssertTrue(reducer.wakeCompleted())
+
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .quit)
+        XCTAssertNil(reducer.beginStart())
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testSleepDuringStartupCleanupFailureBlocksWakeRecoveryUntilCleanupSucceeds() {
+        var reducer = SessionLifecycleReducer()
+        let startupGeneration = try! XCTUnwrap(reducer.beginStart())
+        XCTAssertTrue(reducer.sleepBegan())
+        XCTAssertFalse(reducer.startupSucceeded(generation: startupGeneration))
+        reducer.cleanupFailed(reason: .systemSleep)
+        XCTAssertTrue(reducer.wakeCompleted())
+
+        XCTAssertTrue(reducer.cleanupPending)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .recover)
+        XCTAssertNotNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testSleepDuringStartupCleanupSuccessDefersRecoveryUntilWake() {
+        var reducer = SessionLifecycleReducer()
+        let startupGeneration = try! XCTUnwrap(reducer.beginStart())
+        XCTAssertTrue(reducer.sleepBegan())
+        XCTAssertFalse(reducer.startupSucceeded(generation: startupGeneration))
+        reducer.beginCleanup(reason: .systemSleep)
+
+        XCTAssertEqual(reducer.cleanupSucceeded(reason: .systemSleep), .sleeping)
+        XCTAssertNil(reducer.beginRecoveryAttempt())
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertNotNil(reducer.beginRecoveryAttempt())
+    }
+
+    func testRepeatedSleepAndWakeNotificationsAreIdempotent() {
+        var reducer = runningReducer()
+        let originalGeneration = reducer.generation
+        XCTAssertTrue(reducer.sleepBegan())
+        let sleepGeneration = reducer.generation
+        XCTAssertFalse(reducer.sleepBegan())
+        XCTAssertEqual(reducer.generation, sleepGeneration)
+        XCTAssertGreaterThan(sleepGeneration, originalGeneration)
+        XCTAssertTrue(reducer.wakeCompleted())
+        let wakePhase = reducer.phase
+        XCTAssertFalse(reducer.wakeCompleted())
+        XCTAssertEqual(reducer.phase, wakePhase)
+    }
+
+    func testStaleStartupAndListenerEventsAfterWakeAreRejected() {
+        var reducer = SessionLifecycleReducer()
+        let oldGeneration = try! XCTUnwrap(reducer.beginStart())
+        XCTAssertTrue(reducer.sleepBegan())
+        XCTAssertTrue(reducer.wakeCompleted())
+        XCTAssertFalse(reducer.startupSucceeded(generation: oldGeneration))
+        XCTAssertFalse(reducer.recordOutputChange(generation: oldGeneration))
         XCTAssertNotNil(reducer.beginRecoveryAttempt())
     }
 

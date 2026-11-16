@@ -5,6 +5,7 @@ public enum SessionCleanupDecision: Equatable {
     case quit
     case restart
     case recover
+    case sleeping
     case stopped
 
     public static func resolve(restartAfter: Bool, quitRequested: inout Bool) -> SessionCleanupDecision {

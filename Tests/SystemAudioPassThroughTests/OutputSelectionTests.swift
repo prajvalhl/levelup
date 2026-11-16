@@ -49,6 +49,17 @@ final class OutputSelectionTests: XCTestCase {
         XCTAssertTrue(gate.observe(snapshot(id: 3, uid: "bt"), revision: 1))
     }
 
+    func testDelayedBluetoothAvailabilityCanSettleAfterWake() {
+        var gate = OutputDeviceStabilityGate()
+        let bluetooth = snapshot(id: 42, uid: "bluetooth-headset")
+        XCTAssertFalse(gate.observe(snapshot(id: 42, uid: "bluetooth-headset", listed: false), revision: 9))
+        XCTAssertFalse(gate.observe(snapshot(id: 42, uid: "bluetooth-headset", alive: false), revision: 9))
+        XCTAssertFalse(gate.accepts(revision: 9))
+        XCTAssertFalse(gate.observe(bluetooth, revision: 9))
+        XCTAssertTrue(gate.observe(bluetooth, revision: 9))
+        XCTAssertTrue(gate.accepts(revision: 9))
+    }
+
     func testNonDefaultReconnectDoesNotChangeCurrentSelection() {
         var gate = OutputDeviceStabilityGate()
         let currentDefault = snapshot(id: 1, uid: "built-in")
