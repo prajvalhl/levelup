@@ -6,7 +6,7 @@ public struct SessionLifecycleReducer: Equatable, Sendable {
         case stopped, starting, running, stopping, sleeping, recovering, cleanupPending, failed
     }
     public enum CleanupReason: Equatable, Sendable {
-        case userStop, quit, applyChanges, outputRecovery, startupFailure, routeHealthFailure
+        case userStop, quit, applyChanges, outputRecovery, startupFailure, routeHealthFailure, systemSleep
     }
 
     public private(set) var intent: Intent = .stopped
@@ -155,12 +155,17 @@ public struct SessionLifecycleReducer: Equatable, Sendable {
             outputChangePending = false
             return .quit
         }
-        guard intent == .running, !isSleeping else {
+        guard intent == .running else {
             phase = isSleeping ? .sleeping : .stopped
             outputChangePending = false
             return .stopped
         }
-        if reason == .outputRecovery || outputChangePending {
+        if isSleeping {
+            outputChangePending = true
+            phase = .sleeping
+            return .sleeping
+        }
+        if reason == .outputRecovery || reason == .systemSleep || outputChangePending {
             phase = .recovering
             return .recover
         }
@@ -180,18 +185,30 @@ public struct SessionLifecycleReducer: Equatable, Sendable {
         phase = .cleanupPending
     }
 
-    public mutating func sleepBegan() {
+    @discardableResult
+    public mutating func sleepBegan() -> Bool {
+        guard !isSleeping else { return false }
         isSleeping = true
         generation &+= 1
-        phase = .sleeping
+        if intent == .running { outputChangePending = true }
+        phase = cleanupPending ? .cleanupPending : .sleeping
+        return true
     }
 
-    public mutating func wakeCompleted() {
+    @discardableResult
+    public mutating func wakeCompleted() -> Bool {
+        guard isSleeping else { return false }
         isSleeping = false
         if cleanupPending { phase = .cleanupPending }
         else if intent == .quit { phase = .stopping }
-        else if intent == .running { phase = .recovering }
+        else if intent == .running {
+            // Wake is a recovery trigger even when Core Audio did not report
+            // any device changes while the Mac was asleep.
+            outputChangePending = true
+            phase = .recovering
+        }
         else { phase = .stopped }
+        return true
     }
 
     public func isCurrent(_ eventGeneration: Int) -> Bool { generation == eventGeneration }

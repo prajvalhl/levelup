@@ -9,6 +9,7 @@ This is an early release for **Apple Silicon (ARM64)** Macs running **macOS 14.4
 - Captures system audio locally with a Core Audio process tap.
 - Passes audio through unchanged in Bypass, or processes it with the Gentle, Balanced, Strong, or Custom compressor/limiter settings.
 - Follows the current macOS default output. When that output changes or disconnects, LevelUp safely cleans up the old route and attempts to build a fresh route for the new default.
+- Responds to macOS sleep and wake notifications: it requests ordered route cleanup before sleep and resolves the current default output before bounded recovery after wake.
 - Uses a custom icon-only menu-bar control that adapts to light and dark appearances, with a popover for starting, stopping, selecting a mode, and editing supported Custom parameters.
 - Restores normal playback by stopping the route and releasing its Core Audio resources.
 
@@ -131,7 +132,7 @@ open -a "$PWD/.build/LevelUp.app" --args \
 - **Rare startup callback failure was observed in earlier testing:** one of 10 earlier lifecycle attempts returned success from `AudioDeviceStart` but the aggregate stayed inactive and delivered no callbacks; cleanup succeeded. A later 10-cycle test completed successfully, and the current recovery implementation has since received manual device-switch and disconnection testing. The original no-callback condition has not been conclusively reproduced or proven impossible. If it happens, LevelUp's watchdog stops and cleans up the route; zero callbacks alone do not establish permission denial or a Core Audio defect.
 - **Requires active audio at startup:** the aggregate may wait for the process tap to receive audio. Start playback in another app before starting LevelUp.
 - **Sample-peak limiting only:** the limiter has no lookahead and does not guarantee true-peak limiting. LevelUp is not a complete loudness equalizer or broadcast loudness processor.
-- **No sleep/wake recovery:** automatic recovery from system sleep or wake is not implemented. After resuming, check LevelUp's status and stop/restart it if needed.
+- **Sleep/wake recovery:** Automatic recovery has been manually exercised on Apple Silicon macOS hardware, and diagnostics were reviewed for six sleep/wake cycles: five cycles with running intent recovered automatically, while one stopped-intent cycle remained stopped. Bluetooth reconnection was also manually exercised, but the reviewed log did not independently establish the reconnection timing or final Bluetooth route. Pre-sleep cleanup is best-effort: its asynchronous Core Audio work is not guaranteed to finish before physical suspension. If cleanup remains incomplete after wake, LevelUp blocks a replacement route and exposes **Retry Cleanup**. These results do not guarantee behavior for every audio device or macOS configuration.
 - **No Intel support:** only Apple Silicon builds are produced.
 - **Unnotarized distribution:** Gatekeeper may require a one-app approval on first launch, as described above.
 
